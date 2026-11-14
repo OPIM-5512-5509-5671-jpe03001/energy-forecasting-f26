@@ -59,11 +59,33 @@ MASTER_KEY = f"{ENERGY_PREFIX}/datasets/forecasts_master.csv"
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
 # ----------------------------------------------------------------------------------------------------------------
-# make_features: copied word for word from the Lab 5 notebook (Part 3). Change it there, change it here.
+# make_features: copied word for word from the Lab 5 / Lab 6 notebook. Change it there, change it here.
 # ----------------------------------------------------------------------------------------------------------------
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
 CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
-FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"]
+LOAD_LAGS = ["load_yesterday_mw", "load_7d_mw", "load_1m_dow_mw", "load_1y_dow_mw"]
+FEATURES = CALENDAR + WEATHER + LOAD_LAGS
+
+
+def lagged_same_dow_utc(hours_utc: pd.DatetimeIndex, days: int = 0, months: int = 0, years: int = 0) -> pd.DatetimeIndex:
+    """Leap-year-aware and DST-aware lag lookup in Connecticut time, snapped to the exact same day of the week."""
+    local = pd.DatetimeIndex(hours_utc).tz_convert("America/New_York")
+    local_naive = local.tz_localize(None)
+    target_dow = local_naive.dayofweek
+
+    if days != 0 and months == 0 and years == 0:
+        shifted_naive = local_naive - pd.Timedelta(days=days)
+    else:
+        offset = pd.DateOffset(years=years, months=months, days=days)
+        days_norm = local_naive.normalize()
+        unique_days = days_norm.unique()
+        day_map = {d: d - offset for d in unique_days}
+        shifted_naive = days_norm.map(day_map) + pd.to_timedelta(local_naive.hour, unit="h")
+
+    dow_diff = ((target_dow - shifted_naive.dayofweek + 3) % 7) - 3
+    snapped_naive = shifted_naive + pd.to_timedelta(dow_diff, unit="D")
+    snapped_local = snapped_naive.tz_localize("America/New_York", ambiguous=True, nonexistent="shift_forward")
+    return snapped_local.tz_convert("UTC")
 
 
 def make_features(hours_utc, weather, load):
@@ -83,11 +105,20 @@ def make_features(hours_utc, weather, load):
     for column in WEATHER:
         out[column] = weather[column].reindex(hours_utc).values
 
-    # Same hour yesterday. If that hour isn't over yet (only the last hour of a live forecast),
+    # 1D lag: same hour yesterday. If that hour isn't over yet (only the last hour of a live forecast),
     # use the hour just before it.
     yesterday = load.reindex(hours_utc - pd.Timedelta(hours=24)).values
     hour_before = load.reindex(hours_utc - pd.Timedelta(hours=25)).values
     out["load_yesterday_mw"] = np.where(np.isnan(yesterday), hour_before, yesterday)
+
+    # 7D lag: same day of week 1 week ago
+    out["load_7d_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, days=7)).values
+
+    # 1M lag: 1 calendar month prior, same day of week (leap-year aware)
+    out["load_1m_dow_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, months=1)).values
+
+    # 1Y lag: 1 calendar year prior, same day of week (leap-year aware)
+    out["load_1y_dow_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, years=1)).values
     return out[FEATURES]
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -141,9 +172,12 @@ def forecast_range(bucket, card, X, preds, targets):
 
 
 def fill_inputs(X, load):
-    """Honest gap filling (rare): a missing weather value takes its neighbor; a missing yesterday load the newest load."""
+    """Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load."""
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
+    for col in LOAD_LAGS:
+        if col in X.columns:
+            X[col] = X[col].fillna(X["load_yesterday_mw"]).fillna(float(load.iloc[-1]))
     return X
 
 
@@ -176,6 +210,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
     if not bucket.blob(QRF_MODEL_KEY).exists():
         raise ValueError("Your model card says hrrr_qrf_pooled, but energy/models/model_qrf.joblib is missing.")
     qrf = joblib.load(io.BytesIO(bucket.blob(QRF_MODEL_KEY).download_as_bytes()))
+    qrf_cols = list(getattr(qrf, "feature_names_in_", FEATURES))
     tables = hrrr_run_tables(card, now)
     weather_source = "hrrr"
     if len(tables) == 0:
@@ -191,7 +226,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
         X = fill_inputs(make_features(targets[covered], table, load), load)
         if X[WEATHER].isna().any().any():
             continue
-        q = qrf.predict(X[FEATURES], quantiles=POOL_QUANTILES)
+        q = qrf.predict(X[qrf_cols], quantiles=POOL_QUANTILES)
         positions = np.where(covered)[0]
         for j in range(len(positions)):
             piles[positions[j]].extend(q[j])
@@ -202,7 +237,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
             empty.append(i)
     if len(empty) > 0:
         X = fill_inputs(make_features(targets[empty], nws_weather, load), load)
-        q = qrf.predict(X[FEATURES], quantiles=POOL_QUANTILES)
+        q = qrf.predict(X[qrf_cols], quantiles=POOL_QUANTILES)
         for j in range(len(empty)):
             piles[empty[j]].extend(q[j])
     low = np.zeros(len(targets))
@@ -246,15 +281,18 @@ def run_once(dry_run: bool = False) -> dict:
     weather = latest_weather(forecasts)
     X = make_features(targets, weather, load)
 
-    # Honest gap filling (rare): a missing weather value takes its neighbor; a missing yesterday load takes the newest load
+    # Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load
     filled_weather = int(X[WEATHER].isna().sum().sum())
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
-    filled_load = int(X["load_yesterday_mw"].isna().sum())
+    filled_load = int(X[LOAD_LAGS].isna().sum().sum())
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
+    for col in LOAD_LAGS:
+        X[col] = X[col].fillna(X["load_yesterday_mw"]).fillna(float(load.iloc[-1]))
     if X[WEATHER].isna().any().any():
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
 
-    preds = model.predict(X[FEATURES])
+    model_cols = list(getattr(model, "feature_names_in_", FEATURES))
+    preds = model.predict(X[model_cols])
     range_error = ""
     pool_info = {}
     try:                         # a broken range never costs you your expected-value forecast
