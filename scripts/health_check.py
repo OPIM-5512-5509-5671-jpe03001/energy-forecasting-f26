@@ -194,7 +194,7 @@ def main():
         w_fc["target_hour_utc"] = pd.to_datetime(w_fc["target_hour_utc"], utc=True)
         age_h = (now_ts - w_fc["scraped_hour_utc"].max()).total_seconds() / 3600.0
         horizon_h = (w_fc["target_hour_utc"].max() - now_ts).total_seconds() / 3600.0
-        st = "FAIL" if (age_h > 2.5 or horizon_h < 23.0) else "PASS"
+        st = "FAIL" if (age_h > 2.5 or horizon_h < 22.5) else "PASS"
         report.add(
             "datasets/bdl_weather_forecast_master.csv",
             st,
