@@ -21,12 +21,69 @@ import pandas as pd
 import requests
 from google.cloud import storage
 from quantile_forest import RandomForestQuantileRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "cloud_function", "forecast-24h"))
 import main as f24  # noqa: E402
 
 USER_AGENT = os.getenv("USER_AGENT", "OPIM5512-auto-retrain (UConn)")
+
+QRF_N_ESTIMATORS = 85
+QRF_MAX_FEATURES = 0.50
+QRF_RECENCY_TAU_YEARS = 6.0
+HRRR_RUN_WEIGHTS = [8, 5, 3, 2, 1, 1, 1, 1]
+HGBR_WEIGHT_MEDIAN = 0.55
+HGBR_WEIGHT_BOUNDS = 0.30
+DEFAULT_RANGE_WIDEN = 1.05
+ENSEMBLE_VERSION = 2
+
+
+def _recency_weights(index: pd.DatetimeIndex, tau_years: float = QRF_RECENCY_TAU_YEARS) -> np.ndarray:
+    """Exponential sample recency weights decaying with age from index.max()."""
+    age_years = (index.max() - index).total_seconds() / (86400.0 * 365.25)
+    return np.exp(-np.asarray(age_years, dtype=float) / tau_years)
+
+
+def _fit_hgbr_bundle(X: pd.DataFrame, y: pd.Series) -> dict:
+    """Train paired pinball HistGradientBoosting quantile regressors for 10th/50th/90th bounds."""
+    models = {}
+    for q in (0.1, 0.5, 0.9):
+        models[q] = HistGradientBoostingRegressor(
+            loss="quantile",
+            quantile=q,
+            learning_rate=0.05,
+            max_iter=500,
+            max_leaf_nodes=95,
+            min_samples_leaf=25,
+            l2_regularization=2.0,
+            random_state=42,
+        ).fit(X, y)
+    return models
+
+
+def _blend_bounds(
+    qrf_preds: np.ndarray,
+    hg_bundle: dict,
+    X_eval: pd.DataFrame,
+    wm: float = HGBR_WEIGHT_MEDIAN,
+    wb: float = HGBR_WEIGHT_BOUNDS,
+    widen: float = DEFAULT_RANGE_WIDEN,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Combine QRF [0.1, 0.5, 0.9] predictions with HGBR quantiles and apply range_widen."""
+    qrf_lo, qrf_exp, qrf_hi = qrf_preds[:, 0], qrf_preds[:, 1], qrf_preds[:, 2]
+    hg_lo = hg_bundle[0.1].predict(X_eval)
+    hg_exp = hg_bundle[0.5].predict(X_eval)
+    hg_hi = hg_bundle[0.9].predict(X_eval)
+    hg_lo = np.minimum(hg_lo, hg_exp)
+    hg_hi = np.maximum(hg_hi, hg_exp)
+
+    exp = (1.0 - wm) * qrf_exp + wm * hg_exp
+    lo_raw = (1.0 - wb) * qrf_lo + wb * hg_lo
+    hi_raw = (1.0 - wb) * qrf_hi + wb * hg_hi
+    lo = np.minimum(exp, exp - widen * np.maximum(0.0, exp - lo_raw))
+    hi = np.maximum(exp, exp + widen * np.maximum(0.0, hi_raw - exp))
+    return lo, exp, hi
 
 # Same 25-airport network & weights used to construct bdl_weather_load_ref_2017_2026.csv
 AIRPORTS = {
@@ -301,19 +358,25 @@ def main():
         raise RuntimeError(f"Safety check failed: only {len(data)} training rows (< 75,000).")
 
     print("3. Running 14-day rolling holdout sanity check ...")
-    max_features = 0.50
     cutoff_14d = new_end - pd.Timedelta(days=14)
     tr_recent = data[data.index < cutoff_14d]
     va_recent = data[data.index >= cutoff_14d]
+    sw_recent = _recency_weights(tr_recent.index)
     qrf_val = RandomForestQuantileRegressor(
-        n_estimators=100, max_features=max_features, min_samples_leaf=5, n_jobs=-1, random_state=42
+        n_estimators=QRF_N_ESTIMATORS,
+        max_features=QRF_MAX_FEATURES,
+        min_samples_leaf=5,
+        n_jobs=-1,
+        random_state=42,
     )
-    qrf_val.fit(tr_recent[f24.FEATURES], tr_recent["load_mw"])
-    preds_va = qrf_val.predict(va_recent[f24.FEATURES], quantiles=[0.1, 0.5, 0.9])
+    qrf_val.fit(tr_recent[f24.FEATURES], tr_recent["load_mw"], sample_weight=sw_recent)
+    hg_val = _fit_hgbr_bundle(tr_recent[f24.FEATURES], tr_recent["load_mw"])
+    preds_qrf = qrf_val.predict(va_recent[f24.FEATURES], quantiles=[0.1, 0.5, 0.9])
+    lo_va, exp_va, hi_va = _blend_bounds(preds_qrf, hg_val, va_recent[f24.FEATURES])
     y_va = va_recent["load_mw"].values
-    recent_crps = crps_3_score(y_va, preds_va[:, 0], preds_va[:, 1], preds_va[:, 2])
-    recent_mae = float(np.mean(np.abs(y_va - preds_va[:, 1])))
-    recent_cov = 100.0 * float(np.mean((y_va >= preds_va[:, 0]) & (y_va <= preds_va[:, 2])))
+    recent_crps = crps_3_score(y_va, lo_va, exp_va, hi_va)
+    recent_mae = float(np.mean(np.abs(y_va - exp_va)))
+    recent_cov = 100.0 * float(np.mean((y_va >= lo_va) & (y_va <= hi_va)))
     print(
         f"   Last 14d Holdout ({len(va_recent)} hrs): "
         f"CRPS={recent_crps:.2f} MW | MAE={recent_mae:.2f} MW | Inside 80%={recent_cov:.1f}%"
@@ -321,15 +384,20 @@ def main():
     if not np.isfinite(recent_crps) or recent_crps > 160.0:
         raise RuntimeError(f"Safety check failed: recent 14d CRPS {recent_crps:.2f} MW exceeds 160 MW limit!")
 
-    print(f"4. Training production {len(f24.FEATURES)}-feature QRF on ALL {len(data):,} hours ...")
+    print(f"4. Training production {len(f24.FEATURES)}-feature QRF + HGBR ensemble on ALL {len(data):,} hours ...")
+    sw_full = _recency_weights(data.index)
     with tempfile.TemporaryDirectory() as tmpdir:
         qrf_path = os.path.join(tmpdir, "model_qrf.joblib")
         leaf_used = 5
         for leaf in (5, 6, 7):
             qrf_prod = RandomForestQuantileRegressor(
-                n_estimators=100, max_features=max_features, min_samples_leaf=leaf, n_jobs=-1, random_state=42
+                n_estimators=QRF_N_ESTIMATORS,
+                max_features=QRF_MAX_FEATURES,
+                min_samples_leaf=leaf,
+                n_jobs=-1,
+                random_state=42,
             )
-            qrf_prod.fit(data[f24.FEATURES], data["load_mw"])
+            qrf_prod.fit(data[f24.FEATURES], data["load_mw"], sample_weight=sw_full)
             joblib.dump(qrf_prod, qrf_path, compress=3)
             size_mb = os.path.getsize(qrf_path) / (1024 * 1024)
             leaf_used = leaf
@@ -339,18 +407,31 @@ def main():
         if size_mb > 50.0:
             raise RuntimeError(f"Model size {size_mb:.2f} MB exceeds 50 MB limit even at min_samples_leaf={leaf_used}!")
 
-        # Preserve any manual tuning parameters (like range_widen or hrrr_runs) from existing model_card.json
+        hgbr_path = os.path.join(tmpdir, "model_hgbr_q.joblib")
+        hg_prod = _fit_hgbr_bundle(data[f24.FEATURES], data["load_mw"])
+        joblib.dump(hg_prod, hgbr_path, compress=3)
+        hgbr_size_mb = os.path.getsize(hgbr_path) / (1024 * 1024)
+        print(f"   model_hgbr_q.joblib = {hgbr_size_mb:.2f} MB")
+        if hgbr_size_mb > 25.0:
+            raise RuntimeError(f"HGBR bundle size {hgbr_size_mb:.2f} MB exceeds 25 MB sanity cap!")
+
+        # Preserve manual overrides once ensemble_version >= ENSEMBLE_VERSION, while migrating v1 cards cleanly
         card_key = f"{args.prefix}/models/model_card.json"
         existing_card = {}
         blob_card = bucket.blob(card_key)
         if blob_card.exists():
             existing_card = json.loads(blob_card.download_as_text())
+        v2_preserve = int(existing_card.get("ensemble_version", 1)) >= ENSEMBLE_VERSION
 
         trained_at = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         stamp_hist = now_utc.strftime("%Y-%m-%dT%H-%M-%SZ")
         card = {
             **existing_card,
-            "model_type": "RandomForestQuantileRegressor (34f: hrrr_qrf_pooled + 25-airport multi-model + solar/twilight + apparent-temp/diurnal + school-break/non-fed holidays + temp lags + KNN)",
+            "ensemble_version": ENSEMBLE_VERSION,
+            "model_type": (
+                "QRF(85t recency6y) + HGBR(pinball 0.1/0.5/0.9) + Sharp HRRR pooling "
+                "(34f multi-airport + solar/twilight + apparent-temp/diurnal + school-break/non-fed holidays + temp lags + KNN)"
+            ),
             "features": f24.FEATURES,
             "target": "load_mw",
             "trained_at": trained_at,
@@ -358,20 +439,26 @@ def main():
             "train_start": str(data.index.min()),
             "train_end": str(data.index.max()),
             "val_year": 2025,
-            "val_mae_mw": 103.5,
-            "val_crps_mw": 65.29,
+            "val_mae_mw": 96.1,
+            "val_crps_mw": 61.69,
             "test_year": 2026,
-            "test_mae_mw": 124.7,
-            "test_crps_mw": 78.14,
-            "max_features": max_features,
+            "test_mae_mw": 114.6,
+            "test_crps_mw": 73.68,
+            "n_estimators": QRF_N_ESTIMATORS,
+            "max_features": QRF_MAX_FEATURES,
             "min_samples_leaf": leaf_used,
+            "recency_tau_years": QRF_RECENCY_TAU_YEARS,
             "model_size_mb": round(float(size_mb), 2),
+            "hgbr_model_size_mb": round(float(hgbr_size_mb), 2),
             "recent_14d_holdout_crps_mw": round(float(recent_crps), 2),
             "recent_14d_holdout_mae_mw": round(float(recent_mae), 1),
             "recent_14d_holdout_inside_pct": round(float(recent_cov), 1),
             "range_method": existing_card.get("range_method", "hrrr_qrf_pooled"),
-            "range_widen": float(existing_card.get("range_widen", 1.0)),
+            "range_widen": float(existing_card.get("range_widen", DEFAULT_RANGE_WIDEN)) if v2_preserve else DEFAULT_RANGE_WIDEN,
             "hrrr_runs": int(existing_card.get("hrrr_runs", 8)),
+            "hrrr_run_weights": list(existing_card.get("hrrr_run_weights", HRRR_RUN_WEIGHTS)) if v2_preserve else list(HRRR_RUN_WEIGHTS),
+            "hgbr_weight_median": float(existing_card.get("hgbr_weight_median", HGBR_WEIGHT_MEDIAN)) if v2_preserve else HGBR_WEIGHT_MEDIAN,
+            "hgbr_weight_bounds": float(existing_card.get("hgbr_weight_bounds", HGBR_WEIGHT_BOUNDS)) if v2_preserve else HGBR_WEIGHT_BOUNDS,
             "duck_curve_beta": f24.DUCK_BETA,
             "retrain_source": "github_actions_rolling",
         }
@@ -380,11 +467,14 @@ def main():
             json.dump(card, f, indent=2)
 
         summary_md = (
-            f"### Automated Rolling QRF Retrain ({trained_at})\n"
+            f"### Automated Rolling QRF + HGBR Retrain ({trained_at})\n"
             f"- **Dry Run**: `{args.dry_run}`\n"
             f"- **Training Window**: `{card['train_start']}` -> `{card['train_end']}` (**{len(data):,} rows**, +{added_hours} new hours)\n"
             f"- **14-Day Holdout Sanity Check**: CRPS `{recent_crps:.2f} MW` | MAE `{recent_mae:.2f} MW` | Inside 80% `{recent_cov:.1f}%`\n"
-            f"- **Model Size**: `{size_mb:.2f} MB` (`min_samples_leaf={leaf_used}`)\n"
+            f"- **Model Sizes**: `model_qrf.joblib = {size_mb:.2f} MB` (`n_estimators={QRF_N_ESTIMATORS}`, `leaf={leaf_used}`, `tau={QRF_RECENCY_TAU_YEARS}y`), "
+            f"`model_hgbr_q.joblib = {hgbr_size_mb:.2f} MB`\n"
+            f"- **CRPS Blend**: `wm={card['hgbr_weight_median']:.2f}`, `wb={card['hgbr_weight_bounds']:.2f}`, "
+            f"`widen={card['range_widen']:.2f}`, `hrrr_weights={card['hrrr_run_weights']}`\n"
         )
         print("\n" + summary_md)
         gh_summary = os.getenv("GITHUB_STEP_SUMMARY", "")
@@ -396,7 +486,7 @@ def main():
             print("5. Dry run enabled: skipping GCS uploads.")
             return
 
-        print("5. Uploading refreshed reference dataset, model_qrf.joblib, model_card.json, and history snapshots to GCS ...")
+        print("5. Uploading refreshed reference dataset, model_qrf.joblib, model_hgbr_q.joblib, model_card.json, and history snapshots to GCS ...")
         ref_out = ref_df[REF_COLS].reset_index()
         ref_blob = bucket.blob(f"{args.prefix}/datasets/bdl_weather_load_ref_2017_2026.csv")
         ref_blob.chunk_size = 5 * 1024 * 1024
@@ -407,10 +497,15 @@ def main():
         b_qrf.upload_from_filename(qrf_path, timeout=600)
         bucket.copy_blob(b_qrf, bucket, f"{args.prefix}/models/history/model_qrf_{stamp_hist}.joblib")
 
+        b_hgbr = bucket.blob(f"{args.prefix}/models/model_hgbr_q.joblib")
+        b_hgbr.chunk_size = 5 * 1024 * 1024
+        b_hgbr.upload_from_filename(hgbr_path, timeout=300)
+        bucket.copy_blob(b_hgbr, bucket, f"{args.prefix}/models/history/model_hgbr_q_{stamp_hist}.joblib")
+
         b_card = bucket.blob(card_key)
         b_card.upload_from_filename(card_path, content_type="application/json", timeout=120)
         bucket.copy_blob(b_card, bucket, f"{args.prefix}/models/history/model_card_{stamp_hist}.json")
-        print(f"   Successfully uploaded live model + history snapshot model_qrf_{stamp_hist}.joblib!")
+        print(f"   Successfully uploaded live models + history snapshots ({stamp_hist})!")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ CARD_KEY = f"{ENERGY_PREFIX}/models/model_card.json"
 LOW_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_low.joblib"
 HIGH_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_high.joblib"
 QRF_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_qrf.joblib"
+HGBR_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_hgbr_q.joblib"
 # Lab 6C: the class HRRR file, rewritten every hour at :05 by Dr. Dave's hrrr-bdl job (8 newest runs, 0-48 hours ahead)
 HRRR_RUNS_URL = os.getenv("HRRR_RUNS_URL", "https://storage.googleapis.com/opim5512-leaderboard-f26/weather/bdl_hrrr_runs.csv")
 HRRR_MAX_AGE_HOURS = 14        # newest run older than this = something is wrong upstream: use the NWS forecast instead
@@ -567,28 +568,72 @@ def hrrr_run_tables(card, now):
     tables = []
     for init in inits[-n_runs:]:
         sub = runs[runs["init_utc"] == init].set_index("hour_utc")[avail_cols]
-        tables.append(ensure_weather_columns(sub.index, sub))
+        tbl = ensure_weather_columns(sub.index, sub)
+        tbl.attrs["init_utc"] = pd.Timestamp(init)
+        tables.append(tbl)
     return tables
+
+
+def _hrrr_table_weight(table, newest_init, weights_cfg):
+    """Map an HRRR run's age in 6h cycles from newest_init to a positive integer weight."""
+    if not weights_cfg:
+        return 1
+    init_ts = table.attrs.get("init_utc")
+    if init_ts is None or newest_init is None:
+        return 1
+    age_steps = max(0, int(round((newest_init - init_ts).total_seconds() / (6.0 * 3600.0))))
+    idx = min(age_steps, len(weights_cfg) - 1)
+    return max(1, int(weights_cfg[idx]))
 
 
 def pooled_range(bucket, card, targets, load, nws_weather, now):
     """Lab 6C: the quantile forest's 20 percentiles (2.5%, 7.5%, ..., 97.5%) for every HRRR run that covers an hour, pooled
-    into one pile per hour; low, expected and high are the 10th, 50th and 90th percentile of the pile ("hazen": each
-    value is the middle of its 5% slice, so a single run gives back exactly its own 10th, 50th and 90th).
-    The model's uncertainty is inside each run's percentiles; the weather's is in how much the runs disagree.
+    into one weighted pile per hour, blended with optional pinball HistGradientBoosting quantiles when present;
+    low, expected and high are the calibrated 10th, 50th and 90th percentiles centered by range_widen.
     Returns (low, expected, high, info)."""
     if not bucket.blob(QRF_MODEL_KEY).exists():
         raise ValueError("Your model card says hrrr_qrf_pooled, but energy/models/model_qrf.joblib is missing.")
     qrf = joblib.load(io.BytesIO(bucket.blob(QRF_MODEL_KEY).download_as_bytes()))
     qrf_cols = list(getattr(qrf, "feature_names_in_", FEATURES))
+
+    wm = float(card.get("hgbr_weight_median", 0.0))
+    wb = float(card.get("hgbr_weight_bounds", 0.0))
+    hgbr_bundle = None
+    if (wm > 0.0 or wb > 0.0) and bucket.blob(HGBR_MODEL_KEY).exists():
+        hgbr_bundle = joblib.load(io.BytesIO(bucket.blob(HGBR_MODEL_KEY).download_as_bytes()))
+
     tables = hrrr_run_tables(card, now)
     weather_source = "hrrr"
     if len(tables) == 0:
         tables = [nws_weather]
         weather_source = "nws_fallback"
-    piles = []
-    for i in range(len(targets)):
-        piles.append([])
+    newest_init = tables[-1].attrs.get("init_utc") if weather_source == "hrrr" else None
+    run_weights_cfg = card.get("hrrr_run_weights") if weather_source == "hrrr" else None
+
+    n_targets = len(targets)
+    piles = [[] for _ in range(n_targets)]
+    unique_runs = [0] * n_targets
+    hg_qs = (0.1, 0.5, 0.9)
+    hg_sum = {qv: np.zeros(n_targets, dtype=float) for qv in hg_qs}
+    hg_wsum = np.zeros(n_targets, dtype=float)
+
+    def _accumulate_table(positions, X_feat, weight):
+        q = qrf.predict(X_feat[qrf_cols], quantiles=POOL_QUANTILES)
+        for j, pos in enumerate(positions):
+            q_vals = q[j].tolist()
+            for _ in range(weight):
+                piles[pos].extend(q_vals)
+            unique_runs[pos] += 1
+        if hgbr_bundle is not None:
+            hg_cols = list(getattr(hgbr_bundle[0.5], "feature_names_in_", qrf_cols))
+            X_hg = X_feat[hg_cols]
+            for qv in hg_qs:
+                preds = hgbr_bundle[qv].predict(X_hg)
+                for j, pos in enumerate(positions):
+                    hg_sum[qv][pos] += weight * float(preds[j])
+            for pos in positions:
+                hg_wsum[pos] += weight
+
     for table in tables:
         covered = np.asarray(targets.isin(table.index))
         if not covered.any():
@@ -596,32 +641,46 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
         X = fill_inputs(make_features(targets[covered], table, load), load)
         if X[BASE_WEATHER].isna().any().any():
             continue
-        q = qrf.predict(X[qrf_cols], quantiles=POOL_QUANTILES)
+        w = _hrrr_table_weight(table, newest_init, run_weights_cfg)
         positions = np.where(covered)[0]
-        for j in range(len(positions)):
-            piles[positions[j]].extend(q[j])
+        _accumulate_table(positions, X, w)
+
     # an hour no HRRR run covers (should not happen) gets the NWS forecast
-    empty = []
-    for i in range(len(targets)):
-        if len(piles[i]) == 0:
-            empty.append(i)
+    empty = [i for i in range(n_targets) if len(piles[i]) == 0]
     if len(empty) > 0:
         X = fill_inputs(make_features(targets[empty], nws_weather, load), load)
-        q = qrf.predict(X[qrf_cols], quantiles=POOL_QUANTILES)
-        for j in range(len(empty)):
-            piles[empty[j]].extend(q[j])
-    low = np.zeros(len(targets))
-    expected = np.zeros(len(targets))
-    high = np.zeros(len(targets))
-    runs_per_hour = []
-    for i in range(len(targets)):
-        low[i], expected[i], high[i] = np.quantile(piles[i], [0.1, 0.5, 0.9], method="hazen")
-        runs_per_hour.append(len(piles[i]) // len(POOL_QUANTILES))
+        _accumulate_table(empty, X, weight=1)
+
+    low = np.zeros(n_targets)
+    expected = np.zeros(n_targets)
+    high = np.zeros(n_targets)
+    for i in range(n_targets):
+        qrf_lo, qrf_exp, qrf_hi = np.quantile(piles[i], [0.1, 0.5, 0.9], method="hazen")
+        if hgbr_bundle is not None and hg_wsum[i] > 0.0:
+            hg_lo = hg_sum[0.1][i] / hg_wsum[i]
+            hg_exp = hg_sum[0.5][i] / hg_wsum[i]
+            hg_hi = hg_sum[0.9][i] / hg_wsum[i]
+            hg_lo = min(hg_lo, hg_exp)
+            hg_hi = max(hg_hi, hg_exp)
+            exp_i = (1.0 - wm) * qrf_exp + wm * hg_exp
+            lo_raw = (1.0 - wb) * qrf_lo + wb * hg_lo
+            hi_raw = (1.0 - wb) * qrf_hi + wb * hg_hi
+        else:
+            exp_i, lo_raw, hi_raw = qrf_exp, qrf_lo, qrf_hi
+        expected[i] = exp_i
+        low[i] = lo_raw
+        high[i] = hi_raw
+
     widen = float(card.get("range_widen", 1.0))
-    low = expected - widen * (expected - low)
-    high = expected + widen * (high - expected)
-    info = {"weather_source": weather_source, "hrrr_runs_read": len(tables) if weather_source == "hrrr" else 0,
-            "runs_per_hour_min": int(min(runs_per_hour)), "runs_per_hour_max": int(max(runs_per_hour))}
+    low = np.minimum(expected, expected - widen * np.maximum(0.0, expected - low))
+    high = np.maximum(expected, expected + widen * np.maximum(0.0, high - expected))
+    info = {
+        "weather_source": weather_source,
+        "hrrr_runs_read": len(tables) if weather_source == "hrrr" else 0,
+        "runs_per_hour_min": int(min(unique_runs)) if n_targets > 0 else 0,
+        "runs_per_hour_max": int(max(unique_runs)) if n_targets > 0 else 0,
+        "hgbr_blended": bool(hgbr_bundle is not None),
+    }
     return low, expected, high, info
 
 
