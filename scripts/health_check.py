@@ -245,6 +245,7 @@ def main():
 
     # 9. Model artifact, model card, feature alignment, and daily retrain freshness
     qrf_blob = bucket.blob(f"{args.prefix}/models/model_qrf.joblib")
+    hgbr_blob = bucket.blob(f"{args.prefix}/models/model_hgbr_q.joblib")
     card_blob = bucket.blob(f"{args.prefix}/models/model_card.json")
     if not qrf_blob.exists() or not card_blob.exists():
         report.add("Model Artifact & Card", "FAIL", "model_qrf.joblib or model_card.json missing in GCS")
@@ -256,12 +257,23 @@ def main():
         age_h = (now_ts - trained_at).total_seconds() / 3600.0 if pd.notna(trained_at) else 999.0
         card_feats = list(card.get("features", []))
         feats_match = card_feats == list(f24.FEATURES)
+        wm = float(card.get("hgbr_weight_median", 0.0))
+        wb = float(card.get("hgbr_weight_bounds", 0.0))
+        needs_hgbr = wm > 0.0 or wb > 0.0
+        hgbr_ok = (not needs_hgbr) or hgbr_blob.exists()
+        hgbr_info = ""
+        if needs_hgbr and hgbr_blob.exists():
+            hgbr_blob.reload()
+            hgbr_mb = (hgbr_blob.size or 0) / (1024 * 1024)
+            hgbr_info = f", hgbr={hgbr_mb:.2f} MB (wm={wm:.2f}, wb={wb:.2f}, widen={card.get('range_widen', 1.0)})"
+        elif needs_hgbr:
+            hgbr_info = ", hgbr=MISSING"
         detail = (
-            f"size={size_mb:.2f} MB (<=50), trained {age_h:.1f}h ago, "
+            f"qrf={size_mb:.2f} MB (<=50){hgbr_info}, trained {age_h:.1f}h ago, "
             f"rows={card.get('train_rows')}, features_match={feats_match} ({len(card_feats)}/{len(f24.FEATURES)}), "
             f"14d_crps={card.get('recent_14d_holdout_crps_mw', 'n/a')} MW"
         )
-        if size_mb > 50.0 or not feats_match:
+        if size_mb > 50.0 or not feats_match or not hgbr_ok:
             report.add("Model Artifact & Card", "FAIL", detail)
         elif age_h > 36.0:
             report.add("Model Artifact & Card", "WARN", detail + " (retrain >36h old)")
