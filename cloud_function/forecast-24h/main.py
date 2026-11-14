@@ -51,6 +51,8 @@ HRRR_MAX_AGE_HOURS = 14        # newest run older than this = something is wrong
 POOL_QUANTILES = [0.025, 0.075, 0.125, 0.175, 0.225, 0.275, 0.325, 0.375, 0.425, 0.475, 0.525, 0.575, 0.625, 0.675, 0.725,
                   0.775, 0.825, 0.875, 0.925, 0.975]
 WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_forecast_master.csv"
+OBS_WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_obs_master.csv"
+KNN_REF_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_load_ref_2017_2026.csv"
 LOAD_KEY = f"{ENERGY_PREFIX}/datasets/ct_load_5min_hourly_master.csv"
 LATEST_KEY = f"{ENERGY_PREFIX}/forecasts/latest.csv"
 HISTORY_PREFIX = f"{ENERGY_PREFIX}/forecasts/history"
@@ -64,7 +66,105 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
 CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
 LOAD_LAGS = ["load_yesterday_mw", "load_7d_mw", "load_1m_dow_mw", "load_1y_dow_mw"]
-FEATURES = CALENDAR + WEATHER + LOAD_LAGS
+FEATURES = CALENDAR + WEATHER + LOAD_LAGS + ["knn_weather_load_mw"]
+HOLIDAYS = USFederalHolidayCalendar().holidays(start="2015-01-01", end="2030-12-31")
+
+W_MEAN = np.array([51.8, 39.2, 66.5, 8.2, 52.0, 3.2, 11.4], dtype=np.float32)
+W_STD = np.array([19.2, 19.8, 21.5, 5.4, 38.5, 5.5, 13.5], dtype=np.float32)
+WEIGHTS = np.array([2.5, 1.5, 0.6, 0.7, 0.8, 2.0, 1.5, 1.2, 1.2], dtype=np.float32)
+BUCKETS = {}
+
+
+def encode_weather_vec(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame) -> np.ndarray:
+    loc = pd.DatetimeIndex(hours_utc).tz_convert("America/New_York")
+    doy_rad = 2.0 * np.pi * loc.dayofyear.values / 365.25
+    w_mat = weather_df[WEATHER].reindex(hours_utc).values.astype(np.float32)
+    temp = w_mat[:, 0:1]
+    cdd = np.maximum(0.0, temp - 65.0)
+    hdd = np.maximum(0.0, 60.0 - temp)
+    w_ext = np.hstack([w_mat, cdd, hdd])
+    w_norm = (w_ext - W_MEAN) / W_STD
+    feats = np.column_stack([w_norm, np.sin(doy_rad).astype(np.float32), np.cos(doy_rad).astype(np.float32)])
+    return feats * WEIGHTS
+
+
+def get_day_regime(loc: pd.DatetimeIndex) -> np.ndarray:
+    is_hol = loc.tz_localize(None).normalize().isin(HOLIDAYS)
+    dow = loc.dayofweek.values
+    return np.where(is_hol | (dow == 6), 2, np.where(dow == 5, 1, 0))
+
+
+def init_knn_buckets(ref_df: pd.DataFrame):
+    global BUCKETS
+    ref_loc = pd.DatetimeIndex(ref_df.index).tz_convert("America/New_York")
+    ref_h = ref_loc.hour.values
+    ref_reg = get_day_regime(ref_loc)
+    ref_vecs = encode_weather_vec(ref_df.index, ref_df)
+    ref_loads = ref_df["load_mw"].values.astype(np.float32)
+    ref_t_sec = pd.DatetimeIndex(ref_df.index).as_unit("s").asi8.astype(np.int64)
+    BUCKETS = {}
+    for h in range(24):
+        for reg in (0, 1, 2):
+            mask = (ref_h == h) & (ref_reg == reg)
+            BUCKETS[(h, reg)] = (ref_t_sec[mask], ref_vecs[mask], ref_loads[mask])
+
+
+def compute_knn_weather_load(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame,
+                             k_neighbors: int = 15, max_years_back: float = 4.0, recency_tau_years: float = 2.5) -> np.ndarray:
+    hours_utc = pd.DatetimeIndex(hours_utc)
+    if not BUCKETS:
+        return np.full(len(hours_utc), np.nan, dtype=np.float64)
+    loc = hours_utc.tz_convert("America/New_York")
+    h_arr = loc.hour.values
+    reg_arr = get_day_regime(loc)
+    q_vecs = encode_weather_vec(hours_utc, weather_df)
+    q_t_sec = hours_utc.as_unit("s").asi8.astype(np.int64)
+
+    knn_mean = np.full(len(hours_utc), np.nan, dtype=np.float64)
+    min_gap_sec = 48 * 3600
+    max_gap_sec = int(max_years_back * 365.25 * 86400)
+    tau_sec = recency_tau_years * 365.25 * 86400
+
+    for h in range(24):
+        for reg in (0, 1, 2):
+            q_idx = np.where((h_arr == h) & (reg_arr == reg))[0]
+            if len(q_idx) == 0:
+                continue
+            qv = q_vecs[q_idx]
+            valid_q = ~np.isnan(qv).any(axis=1)
+            if not valid_q.any():
+                continue
+            q_idx = q_idx[valid_q]
+            qv = qv[valid_q]
+            qt = q_t_sec[q_idx]
+
+            bt, bv, bl = BUCKETS[(h, reg)]
+            q_norm2 = np.sum(qv * qv, axis=1, keepdims=True)
+            b_norm2 = np.sum(bv * bv, axis=1, keepdims=True).T
+            d2 = np.maximum(0.0, q_norm2 + b_norm2 - 2.0 * (qv @ bv.T))
+
+            dt = qt[:, None] - bt[None, :]
+            invalid = (dt < min_gap_sec) | (dt > max_gap_sec)
+            d2[invalid] = np.inf
+
+            k_eff = min(k_neighbors, bv.shape[0])
+            part_idx = np.argpartition(d2, kth=k_eff - 1, axis=1)[:, :k_eff]
+            row_idx = np.arange(len(q_idx))[:, None]
+            top_d2 = d2[row_idx, part_idx]
+            top_dt = dt[row_idx, part_idx]
+            top_loads = bl[part_idx]
+
+            has_valid = np.isfinite(top_d2).any(axis=1)
+            dists = np.sqrt(np.where(np.isfinite(top_d2), top_d2, 1e9))
+            recency_w = np.exp(-np.clip(top_dt, 0, None) / tau_sec)
+            w = np.where(np.isfinite(top_d2), recency_w / (dists + 0.15), 0.0)
+            w_sum = np.sum(w, axis=1, keepdims=True)
+            w_norm = np.where(w_sum > 0, w / w_sum, 0.0)
+
+            mean_val = np.sum(w_norm * top_loads, axis=1)
+            knn_mean[q_idx[has_valid]] = mean_val[has_valid]
+
+    return knn_mean
 
 
 def lagged_same_dow_utc(hours_utc: pd.DatetimeIndex, days: int = 0, months: int = 0, years: int = 0) -> pd.DatetimeIndex:
@@ -99,8 +199,7 @@ def make_features(hours_utc, weather, load):
     out["day_of_week"] = local.dayofweek                       # 0 = Monday ... 6 = Sunday
     out["month"] = local.month
     out["is_weekend"] = (local.dayofweek >= 5).astype(int)
-    holidays = USFederalHolidayCalendar().holidays(start="2020-01-01", end="2030-12-31")
-    out["is_holiday"] = local.tz_localize(None).normalize().isin(holidays).astype(int)
+    out["is_holiday"] = local.tz_localize(None).normalize().isin(HOLIDAYS).astype(int)
 
     for column in WEATHER:
         out[column] = weather[column].reindex(hours_utc).values
@@ -119,6 +218,9 @@ def make_features(hours_utc, weather, load):
 
     # 1Y lag: 1 calendar year prior, same day of week (leap-year aware)
     out["load_1y_dow_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, years=1)).values
+
+    # KNN weather-analog load: weighted mean load of the 15 closest past weather-analog hours
+    out["knn_weather_load_mw"] = np.round(compute_knn_weather_load(hours_utc, out[WEATHER]), 1)
     return out[FEATURES]
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -174,8 +276,10 @@ def forecast_range(bucket, card, X, preds, targets):
 def fill_inputs(X, load):
     """Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load."""
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
+    if "knn_weather_load_mw" in X.columns and X["knn_weather_load_mw"].isna().any():
+        X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X[WEATHER]), 1)
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
-    for col in LOAD_LAGS:
+    for col in LOAD_LAGS + ["knn_weather_load_mw"]:
         if col in X.columns:
             X[col] = X[col].fillna(X["load_yesterday_mw"]).fillna(float(load.iloc[-1]))
     return X
@@ -275,6 +379,21 @@ def run_once(dry_run: bool = False) -> dict:
     load_table["hour_utc"] = pd.to_datetime(load_table["hour_utc"], utc=True)
     load = load_table.set_index("hour_utc")["load_mw_5min_avg"].sort_index()
 
+    # Load historical weather + load reference archive (2017-2026) + live observed weather for KNN weather analogs
+    ref_table = read_csv(bucket, KNN_REF_KEY)
+    if ref_table is not None and len(ref_table) > 0:
+        ref_table["hour_utc"] = pd.to_datetime(ref_table["hour_utc"], utc=True)
+        ref_df = ref_table.set_index("hour_utc")[WEATHER + ["load_mw"]].sort_index()
+        obs_table = read_csv(bucket, OBS_WEATHER_KEY)
+        if obs_table is not None and len(obs_table) > 0:
+            obs_table["hour_utc"] = pd.to_datetime(obs_table["hour_utc"], utc=True)
+            obs_df = obs_table.set_index("hour_utc")[WEATHER].sort_index()
+            obs_df["load_mw"] = load.reindex(obs_df.index)
+            obs_df = obs_df.dropna()
+            ref_df = pd.concat([ref_df, obs_df])
+            ref_df = ref_df[~ref_df.index.duplicated(keep="last")].sort_index()
+        init_knn_buckets(ref_df)
+
     now = datetime.now(timezone.utc)
     this_hour = pd.Timestamp(now).floor("h")
     targets = pd.date_range(this_hour + pd.Timedelta(hours=1), periods=HOURS_AHEAD, freq="h")
@@ -284,9 +403,11 @@ def run_once(dry_run: bool = False) -> dict:
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load
     filled_weather = int(X[WEATHER].isna().sum().sum())
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
-    filled_load = int(X[LOAD_LAGS].isna().sum().sum())
+    if X["knn_weather_load_mw"].isna().any():
+        X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X[WEATHER]), 1)
+    filled_load = int(X[LOAD_LAGS + ["knn_weather_load_mw"]].isna().sum().sum())
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
-    for col in LOAD_LAGS:
+    for col in LOAD_LAGS + ["knn_weather_load_mw"]:
         X[col] = X[col].fillna(X["load_yesterday_mw"]).fillna(float(load.iloc[-1]))
     if X[WEATHER].isna().any().any():
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
