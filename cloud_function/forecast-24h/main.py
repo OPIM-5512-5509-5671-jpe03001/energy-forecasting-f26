@@ -3,16 +3,17 @@
 # Every hour (:20, after the weather scrapers at :05 and the ISO-NE scraper at :15) this function:
 #   1. loads your live model:          gs://<bucket>/energy/models/model.joblib (+ model_card.json)
 #   2. picks the next 24 FULL hours:   if it runs at 2:20 p.m., it forecasts 3 p.m. today ... 2 p.m. tomorrow
-#   3. builds the features with make_features(), the SAME code as the Lab 5 notebook:
-#        weather  -> the newest NWS forecast for each hour (bdl_weather_forecast_master.csv)
-#        load     -> the load at the same hour yesterday (ct_load_5min_hourly_master.csv, live five-minute load)
+#   3. builds the features with make_features(), the SAME code as the Lab 5 / Lab 6 notebook:
+#        weather  -> the newest NWS + 25-airport multi-model forecast for each hour
+#                    (bdl_weather_forecast_master.csv + regional_weather_forecast_master.csv)
+#        load     -> 1D, 7D, 1M (same DOW), and 1Y (same DOW) load lags + 25-airport/solar KNN weather-analog load
 #   4. adds a low and high value (an 80% range: 10th and 90th percentiles) if your model card says how (Lab 6):
 #        "range_method": "quantile_models"  -> two more models, energy/models/model_low.joblib and model_high.joblib
 #        "range_method": "offsets_by_hour"  -> "range_offsets_mw": {"low": [24 MW], "high": [24 MW]}, by Connecticut hour
 #        "range_method": "hrrr_qrf_pooled"  -> Lab 6C: energy/models/model_qrf.joblib (a quantile forest) on EVERY recent HRRR
 #                                              run that covers each hour (weather uncertainty), pooled into one low,
 #                                              expected and high. HRRR runs come from Dr. Dave's class file (HRRR_RUNS_URL);
-#                                              if it is missing or stale, the NWS forecast is used instead
+#                                              if it is missing or stale, the NWS/multi-model forecast is used instead
 #        no "range_method" (Lab 5)          -> expected value only (the low and high columns stay empty)
 #   5. writes 24 rows (target_hour_utc, predicted_low_mw, predicted_load_mw, predicted_high_mw, ...):
 #        gs://<bucket>/energy/forecasts/latest.csv                       <- replaced every hour (Lab 6 reads this one)
@@ -51,6 +52,7 @@ HRRR_MAX_AGE_HOURS = 14        # newest run older than this = something is wrong
 POOL_QUANTILES = [0.025, 0.075, 0.125, 0.175, 0.225, 0.275, 0.325, 0.375, 0.425, 0.475, 0.525, 0.575, 0.625, 0.675, 0.725,
                   0.775, 0.825, 0.875, 0.925, 0.975]
 WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_forecast_master.csv"
+REGIONAL_WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/regional_weather_forecast_master.csv"
 OBS_WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_obs_master.csv"
 KNN_REF_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_load_ref_2017_2026.csv"
 LOAD_KEY = f"{ENERGY_PREFIX}/datasets/ct_load_5min_hourly_master.csv"
@@ -63,26 +65,87 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 # ----------------------------------------------------------------------------------------------------------------
 # make_features: copied word for word from the Lab 5 / Lab 6 notebook. Change it there, change it here.
 # ----------------------------------------------------------------------------------------------------------------
-WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
+BASE_WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
+WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct",
+           "solar_wm2", "ct_coast_inland_temp_diff_f"]
+KNN_EXTRA_COLS = ["west_east_temp_diff_f"]
 CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
 LOAD_LAGS = ["load_yesterday_mw", "load_7d_mw", "load_1m_dow_mw", "load_1y_dow_mw"]
 FEATURES = CALENDAR + WEATHER + LOAD_LAGS + ["knn_weather_load_mw"]
 HOLIDAYS = USFederalHolidayCalendar().holidays(start="2015-01-01", end="2030-12-31")
 
-W_MEAN = np.array([51.8, 39.2, 66.5, 8.2, 52.0, 3.2, 11.4], dtype=np.float32)
-W_STD = np.array([19.2, 19.8, 21.5, 5.4, 38.5, 5.5, 13.5], dtype=np.float32)
-WEIGHTS = np.array([2.5, 1.5, 0.6, 0.7, 0.8, 2.0, 1.5, 1.2, 1.2], dtype=np.float32)
+# Empirical mean, std, and feature weights for 10-variable + seasonal KNN weather-analog matcher:
+# [temp_f, dewpoint_f, rel_humidity_pct, wind_speed_mph, cloud_cover_pct, cdd, hdd,
+#  solar_wm2, ct_coast_inland_temp_diff_f, west_east_temp_diff_f, sin_doy, cos_doy]
+W_MEAN = np.array([52.75, 40.53, 66.46, 7.59, 61.98, 3.02, 12.03, 156.84, 0.71, 1.47], dtype=np.float32)
+W_STD = np.array([18.92, 19.37, 20.49, 5.20, 35.00, 5.91, 13.54, 232.07, 3.79, 3.09], dtype=np.float32)
+WEIGHTS = np.array([2.5, 1.5, 0.6, 0.7, 0.8, 2.0, 1.5, 0.9, 0.5, 0.4, 1.2, 1.2], dtype=np.float32)
 BUCKETS = {}
+LATEST_REGIONAL = None
+
+
+def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) -> np.ndarray:
+    """Physical clear-sky solar irradiance at BDL (41.9389N, -72.6832W) attenuated by cloud cover."""
+    hours_utc = pd.DatetimeIndex(hours_utc)
+    lat_rad = np.deg2rad(41.9389)
+    lon_deg = -72.6832
+    doy = hours_utc.dayofyear.values
+    hr_utc = hours_utc.hour.values - 0.5
+    gamma = 2.0 * np.pi / 365.25 * (doy - 1 + (hr_utc - 12.0) / 24.0)
+    eqtime = 229.18 * (0.000075 + 0.001868 * np.cos(gamma) - 0.032077 * np.sin(gamma)
+                       - 0.014615 * np.cos(2 * gamma) - 0.040849 * np.sin(2 * gamma))
+    decl = (0.006918 - 0.399912 * np.cos(gamma) + 0.070257 * np.sin(gamma)
+            - 0.006758 * np.cos(2 * gamma) + 0.000907 * np.sin(2 * gamma)
+            - 0.002697 * np.cos(3 * gamma) + 0.00148 * np.sin(3 * gamma))
+    time_offset = eqtime + 4.0 * lon_deg
+    tst = hr_utc * 60.0 + time_offset
+    ha = np.deg2rad((tst / 4.0) - 180.0)
+    sin_el = np.sin(lat_rad) * np.sin(decl) + np.cos(lat_rad) * np.cos(decl) * np.cos(ha)
+    sin_el = np.maximum(0.0, sin_el)
+    clear_sky = 1020.0 * (sin_el ** 1.15)
+    cf = np.clip(np.nan_to_num(np.asarray(cloud_pct, dtype=float), nan=50.0) / 100.0, 0.0, 1.0)
+    atten = 1.0 - 0.68 * (cf ** 2.0)
+    return np.round(clear_sky * atten, 1)
+
+
+def ensure_weather_columns(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame) -> pd.DataFrame:
+    """Ensures solar_wm2, ct_coast_inland_temp_diff_f, and west_east_temp_diff_f exist on any weather table."""
+    hours_utc = pd.DatetimeIndex(hours_utc)
+    w = weather_df.reindex(hours_utc).copy()
+    if LATEST_REGIONAL is not None and len(LATEST_REGIONAL) > 0:
+        reg_sub = LATEST_REGIONAL.reindex(hours_utc)
+        if "solar_wm2" not in w.columns or w["solar_wm2"].isna().any():
+            sol_reg = reg_sub["bdl_solar_wm2"] if "bdl_solar_wm2" in reg_sub.columns else reg_sub.get("ct_pop_solar_wm2")
+            if sol_reg is not None:
+                w["solar_wm2"] = w["solar_wm2"].fillna(sol_reg) if "solar_wm2" in w.columns else sol_reg
+        for col in ["ct_coast_inland_temp_diff_f", "west_east_temp_diff_f"]:
+            if col not in w.columns or w[col].isna().any():
+                if col in reg_sub.columns:
+                    w[col] = w[col].fillna(reg_sub[col]) if col in w.columns else reg_sub[col]
+    if "solar_wm2" not in w.columns:
+        w["solar_wm2"] = compute_clear_sky_solar(hours_utc, w["cloud_cover_pct"].values)
+    elif w["solar_wm2"].isna().any():
+        miss = w["solar_wm2"].isna()
+        w.loc[miss, "solar_wm2"] = compute_clear_sky_solar(hours_utc[miss], w.loc[miss, "cloud_cover_pct"].values)
+    for col in ["ct_coast_inland_temp_diff_f", "west_east_temp_diff_f"]:
+        if col not in w.columns:
+            w[col] = 0.0
+        else:
+            w[col] = w[col].fillna(0.0)
+    return w
 
 
 def encode_weather_vec(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame) -> np.ndarray:
-    loc = pd.DatetimeIndex(hours_utc).tz_convert("America/New_York")
+    hours_utc = pd.DatetimeIndex(hours_utc)
+    loc = hours_utc.tz_convert("America/New_York")
     doy_rad = 2.0 * np.pi * loc.dayofyear.values / 365.25
-    w_mat = weather_df[WEATHER].reindex(hours_utc).values.astype(np.float32)
+    w_df = ensure_weather_columns(hours_utc, weather_df)
+    w_mat = w_df[BASE_WEATHER].values.astype(np.float32)
     temp = w_mat[:, 0:1]
     cdd = np.maximum(0.0, temp - 65.0)
     hdd = np.maximum(0.0, 60.0 - temp)
-    w_ext = np.hstack([w_mat, cdd, hdd])
+    extra = w_df[["solar_wm2", "ct_coast_inland_temp_diff_f", "west_east_temp_diff_f"]].values.astype(np.float32)
+    w_ext = np.hstack([w_mat, cdd, hdd, extra])
     w_norm = (w_ext - W_MEAN) / W_STD
     feats = np.column_stack([w_norm, np.sin(doy_rad).astype(np.float32), np.cos(doy_rad).astype(np.float32)])
     return feats * WEIGHTS
@@ -201,8 +264,9 @@ def make_features(hours_utc, weather, load):
     out["is_weekend"] = (local.dayofweek >= 5).astype(int)
     out["is_holiday"] = local.tz_localize(None).normalize().isin(HOLIDAYS).astype(int)
 
-    for column in WEATHER:
-        out[column] = weather[column].reindex(hours_utc).values
+    w_ens = ensure_weather_columns(hours_utc, weather)
+    for column in WEATHER + KNN_EXTRA_COLS:
+        out[column] = w_ens[column].values
 
     # 1D lag: same hour yesterday. If that hour isn't over yet (only the last hour of a live forecast),
     # use the hour just before it.
@@ -220,7 +284,7 @@ def make_features(hours_utc, weather, load):
     out["load_1y_dow_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, years=1)).values
 
     # KNN weather-analog load: weighted mean load of the 15 closest past weather-analog hours
-    out["knn_weather_load_mw"] = np.round(compute_knn_weather_load(hours_utc, out[WEATHER]), 1)
+    out["knn_weather_load_mw"] = np.round(compute_knn_weather_load(hours_utc, out[WEATHER + KNN_EXTRA_COLS]), 1)
     return out[FEATURES]
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -250,8 +314,10 @@ def forecast_range(bucket, card, X, preds, targets):
             raise ValueError("Your model card says quantile_models, but model_low.joblib or model_high.joblib is missing.")
         low_model = joblib.load(io.BytesIO(bucket.blob(LOW_MODEL_KEY).download_as_bytes()))
         high_model = joblib.load(io.BytesIO(bucket.blob(HIGH_MODEL_KEY).download_as_bytes()))
-        low = low_model.predict(X[FEATURES])
-        high = high_model.predict(X[FEATURES])
+        low_cols = list(getattr(low_model, "feature_names_in_", FEATURES))
+        high_cols = list(getattr(high_model, "feature_names_in_", FEATURES))
+        low = low_model.predict(X[low_cols])
+        high = high_model.predict(X[high_cols])
     elif method == "offsets_by_hour":
         offsets = card["range_offsets_mw"]
         if len(offsets["low"]) != 24 or len(offsets["high"]) != 24:
@@ -262,12 +328,9 @@ def forecast_range(bucket, card, X, preds, targets):
     else:
         return None, None, "none"
 
-    # "range_widen": 1.3 stretches the range 30% around the expected value, no retraining (Lab 6: if the leaderboard
-    # says only 65% of actual loads landed inside your 80% range, your range is too narrow)
     widen = float(card.get("range_widen", 1.0))
     low = preds - widen * (preds - low)
     high = preds + widen * (high - preds)
-    # The expected value always sits inside its own range
     low = np.minimum(low, preds)
     high = np.maximum(high, preds)
     return low, high, method
@@ -277,7 +340,7 @@ def fill_inputs(X, load):
     """Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load."""
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
     if "knn_weather_load_mw" in X.columns and X["knn_weather_load_mw"].isna().any():
-        X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X[WEATHER]), 1)
+        X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
     for col in LOAD_LAGS + ["knn_weather_load_mw"]:
         if col in X.columns:
@@ -299,9 +362,11 @@ def hrrr_run_tables(card, now):
     if len(inits) == 0 or pd.Timestamp(now) - pd.Timestamp(inits[-1]) > pd.Timedelta(hours=HRRR_MAX_AGE_HOURS):
         return []
     n_runs = int(card.get("hrrr_runs", 8))
+    avail_cols = [c for c in BASE_WEATHER + ["solar_wm2"] if c in runs.columns]
     tables = []
     for init in inits[-n_runs:]:
-        tables.append(runs[runs["init_utc"] == init].set_index("hour_utc")[WEATHER])
+        sub = runs[runs["init_utc"] == init].set_index("hour_utc")[avail_cols]
+        tables.append(ensure_weather_columns(sub.index, sub))
     return tables
 
 
@@ -328,7 +393,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
         if not covered.any():
             continue
         X = fill_inputs(make_features(targets[covered], table, load), load)
-        if X[WEATHER].isna().any().any():
+        if X[BASE_WEATHER].isna().any().any():
             continue
         q = qrf.predict(X[qrf_cols], quantiles=POOL_QUANTILES)
         positions = np.where(covered)[0]
@@ -360,6 +425,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
 
 
 def run_once(dry_run: bool = False) -> dict:
+    global LATEST_REGIONAL
     bucket = storage.Client(project=PROJECT_ID).bucket(GCS_BUCKET)
     if not bucket.blob(MODEL_KEY).exists():
         return {"status": "no_model", "message": f"Upload your model to gs://{GCS_BUCKET}/{MODEL_KEY} (Lab 5, Part 7)."}
@@ -372,6 +438,12 @@ def run_once(dry_run: bool = False) -> dict:
     forecasts = read_csv(bucket, WEATHER_KEY)
     if forecasts is None or len(forecasts) == 0:
         return {"status": "no_weather_data", "message": "scraper-weather-forecast has not written its master yet."}
+    reg_forecasts = read_csv(bucket, REGIONAL_WEATHER_KEY)
+    if reg_forecasts is not None and len(reg_forecasts) > 0:
+        LATEST_REGIONAL = latest_weather(reg_forecasts)
+    else:
+        LATEST_REGIONAL = None
+
     load_table = read_csv(bucket, LOAD_KEY)
     if load_table is None or len(load_table) == 0:
         return {"status": "no_load_data", "message": "No ISO-NE load yet: add the ISO_NE_USERNAME and ISO_NE_PASSWORD "
@@ -383,13 +455,16 @@ def run_once(dry_run: bool = False) -> dict:
     ref_table = read_csv(bucket, KNN_REF_KEY)
     if ref_table is not None and len(ref_table) > 0:
         ref_table["hour_utc"] = pd.to_datetime(ref_table["hour_utc"], utc=True)
-        ref_df = ref_table.set_index("hour_utc")[WEATHER + ["load_mw"]].sort_index()
+        ref_df = ref_table.set_index("hour_utc").sort_index()
+        ref_df = ensure_weather_columns(ref_df.index, ref_df)
+        ref_df["load_mw"] = ref_table.set_index("hour_utc")["load_mw"].sort_index()
         obs_table = read_csv(bucket, OBS_WEATHER_KEY)
         if obs_table is not None and len(obs_table) > 0:
             obs_table["hour_utc"] = pd.to_datetime(obs_table["hour_utc"], utc=True)
-            obs_df = obs_table.set_index("hour_utc")[WEATHER].sort_index()
+            obs_df = obs_table.set_index("hour_utc").sort_index()
+            obs_df = ensure_weather_columns(obs_df.index, obs_df)
             obs_df["load_mw"] = load.reindex(obs_df.index)
-            obs_df = obs_df.dropna()
+            obs_df = obs_df.dropna(subset=BASE_WEATHER + ["load_mw"])
             ref_df = pd.concat([ref_df, obs_df])
             ref_df = ref_df[~ref_df.index.duplicated(keep="last")].sort_index()
         init_knn_buckets(ref_df)
@@ -397,19 +472,19 @@ def run_once(dry_run: bool = False) -> dict:
     now = datetime.now(timezone.utc)
     this_hour = pd.Timestamp(now).floor("h")
     targets = pd.date_range(this_hour + pd.Timedelta(hours=1), periods=HOURS_AHEAD, freq="h")
-    weather = latest_weather(forecasts)
+    weather = ensure_weather_columns(targets, latest_weather(forecasts))
     X = make_features(targets, weather, load)
 
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load
-    filled_weather = int(X[WEATHER].isna().sum().sum())
+    filled_weather = int(X[BASE_WEATHER].isna().sum().sum())
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
     if X["knn_weather_load_mw"].isna().any():
-        X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X[WEATHER]), 1)
+        X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
     filled_load = int(X[LOAD_LAGS + ["knn_weather_load_mw"]].isna().sum().sum())
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
     for col in LOAD_LAGS + ["knn_weather_load_mw"]:
         X[col] = X[col].fillna(X["load_yesterday_mw"]).fillna(float(load.iloc[-1]))
-    if X[WEATHER].isna().any().any():
+    if X[BASE_WEATHER].isna().any().any():
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
 
     model_cols = list(getattr(model, "feature_names_in_", FEATURES))
