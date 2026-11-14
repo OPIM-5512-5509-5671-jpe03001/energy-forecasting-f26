@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import joblib
 import numpy as np
@@ -70,13 +70,47 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 BASE_WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct",
            "solar_wm2", "ct_coast_inland_temp_diff_f"]
+TEMP_LAG_FEATURES = ["temp_lag_3h_f", "temp_lag_24h_f", "temp_mean_24h_f", "dewpoint_mean_24h_f"]
 DUCK_CURVE_FEATURES = ["est_solar_gen_mw", "cloud_cover_obs_24h_pct", "cloud_cover_diff_24h_pct", "solar_gen_diff_24h_mw"]
 KNN_EXTRA_COLS = ["west_east_temp_diff_f"]
-CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
+CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday", "is_non_fed_holiday"]
 LOAD_LAGS = ["load_yesterday_mw", "load_7d_mw", "load_1m_dow_mw", "load_1y_dow_mw"]
-FEATURES = CALENDAR + WEATHER + DUCK_CURVE_FEATURES + LOAD_LAGS + ["knn_weather_load_mw"]
+FEATURES = CALENDAR + WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES + LOAD_LAGS + ["knn_weather_load_mw"]
 DUCK_BETA = 0.55
 HOLIDAYS = USFederalHolidayCalendar().holidays(start="2015-01-01", end="2030-12-31")
+
+
+def _easter_sunday(year: int) -> date:
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _build_non_fed_holidays(start_year: int = 2015, end_year: int = 2031) -> set:
+    """Connecticut commercial/school non-federal holiday weekdays with significant grid load drops."""
+    fed = set(pd.DatetimeIndex(HOLIDAYS).date)
+    dates = set()
+    for y in range(start_year, end_year):
+        nov1 = date(y, 11, 1)
+        thanksgiving = nov1 + timedelta(days=((3 - nov1.weekday()) % 7) + 21)
+        election_day = nov1 + timedelta(days=((0 - nov1.weekday()) % 7) + 1)
+        good_friday = _easter_sunday(y) - timedelta(days=2)
+        black_friday = thanksgiving + timedelta(days=1)
+        for d in (good_friday, election_day, black_friday, date(y, 12, 24), date(y, 12, 31)):
+            if d.weekday() < 5 and d not in fed:
+                dates.add(d)
+    return dates
+
+
+NON_FED_HOLIDAYS = _build_non_fed_holidays()
 
 # Empirical mean, std, and feature weights for 10-variable + seasonal KNN weather-analog matcher:
 # [temp_f, dewpoint_f, rel_humidity_pct, wind_speed_mph, cloud_cover_pct, cdd, hdd,
@@ -88,6 +122,8 @@ BUCKETS = {}
 LATEST_REGIONAL = None
 OBS_CLOUD_SERIES = pd.Series(dtype=float)
 OBS_SOLGEN_SERIES = pd.Series(dtype=float)
+OBS_TEMP_SERIES = pd.Series(dtype=float)
+OBS_DEWP_SERIES = pd.Series(dtype=float)
 
 
 def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) -> np.ndarray:
@@ -195,13 +231,14 @@ def encode_weather_vec(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame) ->
 
 
 def get_day_regime(loc: pd.DatetimeIndex) -> np.ndarray:
-    is_hol = loc.tz_localize(None).normalize().isin(HOLIDAYS)
+    is_fed_hol = loc.tz_localize(None).normalize().isin(HOLIDAYS)
+    is_non_fed = np.array([d in NON_FED_HOLIDAYS for d in loc.date], dtype=bool)
     dow = loc.dayofweek.values
-    return np.where(is_hol | (dow == 6), 2, np.where(dow == 5, 1, 0))
+    return np.where(is_fed_hol | is_non_fed | (dow == 6), 2, np.where(dow == 5, 1, 0))
 
 
 def init_knn_buckets(ref_df: pd.DataFrame):
-    global BUCKETS, OBS_CLOUD_SERIES, OBS_SOLGEN_SERIES
+    global BUCKETS, OBS_CLOUD_SERIES, OBS_SOLGEN_SERIES, OBS_TEMP_SERIES, OBS_DEWP_SERIES
     ref_df = ensure_weather_columns(ref_df.index, ref_df)
     _, est_gen = compute_solar_geometry_and_gen(
         ref_df.index, ref_df["solar_wm2"].values, ref_df["cloud_cover_pct"].values, ref_df["temp_f"].values
@@ -209,6 +246,8 @@ def init_knn_buckets(ref_df: pd.DataFrame):
     ref_df["est_solar_gen_mw"] = est_gen
     OBS_CLOUD_SERIES = ref_df["cloud_cover_pct"].sort_index()
     OBS_SOLGEN_SERIES = ref_df["est_solar_gen_mw"].sort_index()
+    OBS_TEMP_SERIES = ref_df["temp_f"].sort_index()
+    OBS_DEWP_SERIES = ref_df["dewpoint_f"].sort_index()
 
     ref_loc = pd.DatetimeIndex(ref_df.index).tz_convert("America/New_York")
     ref_h = ref_loc.hour.values
@@ -325,10 +364,25 @@ def make_features(hours_utc, weather, load):
     out["month"] = local.month
     out["is_weekend"] = (local.dayofweek >= 5).astype(int)
     out["is_holiday"] = local.tz_localize(None).normalize().isin(HOLIDAYS).astype(int)
+    out["is_non_fed_holiday"] = np.array([1 if d in NON_FED_HOLIDAYS else 0 for d in local.date], dtype=int)
 
     w_ens = ensure_weather_columns(hours_utc, weather)
     for column in WEATHER + KNN_EXTRA_COLS:
         out[column] = w_ens[column].values
+
+    # Causal temperature & dewpoint time-series lags: observed past weather stitched to current forecast trajectory
+    w_clean = weather[~weather.index.duplicated(keep="last")].sort_index()
+    full_grid = pd.date_range(hours_utc.min() - pd.Timedelta(hours=24), hours_utc.max(), freq="h", tz="UTC")
+    obs_t = OBS_TEMP_SERIES[~OBS_TEMP_SERIES.index.duplicated(keep="last")] if len(OBS_TEMP_SERIES) > 0 else pd.Series(dtype=float)
+    obs_d = OBS_DEWP_SERIES[~OBS_DEWP_SERIES.index.duplicated(keep="last")] if len(OBS_DEWP_SERIES) > 0 else pd.Series(dtype=float)
+    w_t = pd.to_numeric(w_clean["temp_f"], errors="coerce").reindex(full_grid) if "temp_f" in w_clean.columns else pd.Series(dtype=float)
+    w_d = pd.to_numeric(w_clean["dewpoint_f"], errors="coerce").reindex(full_grid) if "dewpoint_f" in w_clean.columns else pd.Series(dtype=float)
+    s_t = obs_t.reindex(full_grid).combine_first(w_t).interpolate(method="time", limit=12).ffill().bfill()
+    s_d = obs_d.reindex(full_grid).combine_first(w_d).interpolate(method="time", limit=12).ffill().bfill()
+    out["temp_lag_3h_f"] = np.round(s_t.reindex(hours_utc - pd.Timedelta(hours=3)).values, 1)
+    out["temp_lag_24h_f"] = np.round(s_t.reindex(hours_utc - pd.Timedelta(hours=24)).values, 1)
+    out["temp_mean_24h_f"] = np.round(s_t.rolling(24, min_periods=1).mean().reindex(hours_utc).values, 1)
+    out["dewpoint_mean_24h_f"] = np.round(s_d.rolling(24, min_periods=1).mean().reindex(hours_utc).values, 1)
 
     # Solar energy entering the CT grid (est_solar_gen_mw)
     _, est_gen = compute_solar_geometry_and_gen(
@@ -430,7 +484,8 @@ def forecast_range(bucket, card, X, preds, targets):
 
 def fill_inputs(X, load):
     """Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load."""
-    X[WEATHER + DUCK_CURVE_FEATURES] = X[WEATHER + DUCK_CURVE_FEATURES].interpolate(limit_direction="both").fillna(0.0)
+    w_all = WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES
+    X[w_all] = X[w_all].interpolate(limit_direction="both").fillna(0.0)
     if "knn_weather_load_mw" in X.columns and X["knn_weather_load_mw"].isna().any():
         X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
@@ -517,7 +572,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
 
 
 def run_once(dry_run: bool = False) -> dict:
-    global LATEST_REGIONAL, OBS_CLOUD_SERIES, OBS_SOLGEN_SERIES
+    global LATEST_REGIONAL, OBS_CLOUD_SERIES, OBS_SOLGEN_SERIES, OBS_TEMP_SERIES, OBS_DEWP_SERIES
     bucket = storage.Client(project=PROJECT_ID).bucket(GCS_BUCKET)
     if not bucket.blob(MODEL_KEY).exists():
         return {"status": "no_model", "message": f"Upload your model to gs://{GCS_BUCKET}/{MODEL_KEY} (Lab 5, Part 7)."}
@@ -567,6 +622,8 @@ def run_once(dry_run: bool = False) -> dict:
         )
         OBS_CLOUD_SERIES = ref_df["cloud_cover_pct"].sort_index()
         OBS_SOLGEN_SERIES = pd.Series(all_est_gen, index=ref_df.index).sort_index()
+        OBS_TEMP_SERIES = ref_df["temp_f"].sort_index()
+        OBS_DEWP_SERIES = ref_df["dewpoint_f"].sort_index()
 
     now = datetime.now(timezone.utc)
     this_hour = pd.Timestamp(now).floor("h")
@@ -576,7 +633,8 @@ def run_once(dry_run: bool = False) -> dict:
 
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load
     filled_weather = int(X[BASE_WEATHER].isna().sum().sum())
-    X[WEATHER + DUCK_CURVE_FEATURES] = X[WEATHER + DUCK_CURVE_FEATURES].interpolate(limit_direction="both").fillna(0.0)
+    w_all = WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES
+    X[w_all] = X[w_all].interpolate(limit_direction="both").fillna(0.0)
     if X["knn_weather_load_mw"].isna().any():
         X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
     filled_load = int(X[LOAD_LAGS + ["knn_weather_load_mw"]].isna().sum().sum())
