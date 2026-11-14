@@ -4,9 +4,11 @@
 #   1. loads your live model:          gs://<bucket>/energy/models/model.joblib (+ model_card.json)
 #   2. picks the next 24 FULL hours:   if it runs at 2:20 p.m., it forecasts 3 p.m. today ... 2 p.m. tomorrow
 #   3. builds the features with make_features(), the SAME code as the Lab 5 / Lab 6 notebook:
-#        weather  -> the newest NWS + 25-airport multi-model forecast for each hour
-#                    (bdl_weather_forecast_master.csv + regional_weather_forecast_master.csv)
-#        load     -> 1D, 7D, 1M (same DOW), and 1Y (same DOW) load lags + 25-airport/solar KNN weather-analog load
+#        weather     -> the newest NWS + 25-airport multi-model forecast for each hour
+#                       (bdl_weather_forecast_master.csv + regional_weather_forecast_master.csv)
+#        duck curve  -> solar energy entering the CT grid (est_solar_gen_mw), observed vs. forecasted cloud cover
+#                       (cloud_cover_obs_24h_pct, cloud_cover_diff_24h_pct), and 24h solar MW differential (solar_gen_diff_24h_mw)
+#        load        -> Duck-Curve-adjusted 1D, 7D, 1M (same DOW), and 1Y (same DOW) load lags + KNN weather-analog load
 #   4. adds a low and high value (an 80% range: 10th and 90th percentiles) if your model card says how (Lab 6):
 #        "range_method": "quantile_models"  -> two more models, energy/models/model_low.joblib and model_high.joblib
 #        "range_method": "offsets_by_hour"  -> "range_offsets_mw": {"low": [24 MW], "high": [24 MW]}, by Connecticut hour
@@ -68,10 +70,12 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 BASE_WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct",
            "solar_wm2", "ct_coast_inland_temp_diff_f"]
+DUCK_CURVE_FEATURES = ["est_solar_gen_mw", "cloud_cover_obs_24h_pct", "cloud_cover_diff_24h_pct", "solar_gen_diff_24h_mw"]
 KNN_EXTRA_COLS = ["west_east_temp_diff_f"]
 CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
 LOAD_LAGS = ["load_yesterday_mw", "load_7d_mw", "load_1m_dow_mw", "load_1y_dow_mw"]
-FEATURES = CALENDAR + WEATHER + LOAD_LAGS + ["knn_weather_load_mw"]
+FEATURES = CALENDAR + WEATHER + DUCK_CURVE_FEATURES + LOAD_LAGS + ["knn_weather_load_mw"]
+DUCK_BETA = 0.55
 HOLIDAYS = USFederalHolidayCalendar().holidays(start="2015-01-01", end="2030-12-31")
 
 # Empirical mean, std, and feature weights for 10-variable + seasonal KNN weather-analog matcher:
@@ -82,6 +86,8 @@ W_STD = np.array([18.92, 19.37, 20.49, 5.20, 35.00, 5.91, 13.54, 232.07, 3.79, 3
 WEIGHTS = np.array([2.5, 1.5, 0.6, 0.7, 0.8, 2.0, 1.5, 0.9, 0.5, 0.4, 1.2, 1.2], dtype=np.float32)
 BUCKETS = {}
 LATEST_REGIONAL = None
+OBS_CLOUD_SERIES = pd.Series(dtype=float)
+OBS_SOLGEN_SERIES = pd.Series(dtype=float)
 
 
 def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) -> np.ndarray:
@@ -106,6 +112,43 @@ def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) 
     cf = np.clip(np.nan_to_num(np.asarray(cloud_pct, dtype=float), nan=50.0) / 100.0, 0.0, 1.0)
     atten = 1.0 - 0.68 * (cf ** 2.0)
     return np.round(clear_sky * atten, 1)
+
+
+def compute_solar_geometry_and_gen(hours_utc: pd.DatetimeIndex, solar_wm2: np.ndarray,
+                                   cloud_pct: np.ndarray, temp_f: np.ndarray) -> tuple:
+    """Computes (sin_sun_elev, est_solar_gen_mw) representing the estimated MW of solar PV
+    entering the Connecticut grid during daytime hours, accounting for CT BTM PV capacity growth (2017->2026),
+    shortwave irradiance (W/m2), cloud cover attenuation, and panel temperature derating."""
+    hours_utc = pd.DatetimeIndex(hours_utc)
+    lat_rad = np.deg2rad(41.9389)
+    lon_deg = -72.6832
+    doy = hours_utc.dayofyear.values
+    hr_utc = hours_utc.hour.values - 0.5
+    gamma = 2.0 * np.pi / 365.25 * (doy - 1 + (hr_utc - 12.0) / 24.0)
+    eqtime = 229.18 * (0.000075 + 0.001868 * np.cos(gamma) - 0.032077 * np.sin(gamma)
+                       - 0.014615 * np.cos(2 * gamma) - 0.040849 * np.sin(2 * gamma))
+    decl = (0.006918 - 0.399912 * np.cos(gamma) + 0.070257 * np.sin(gamma)
+            - 0.006758 * np.cos(2 * gamma) + 0.000907 * np.sin(2 * gamma)
+            - 0.002697 * np.cos(3 * gamma) + 0.00148 * np.sin(3 * gamma))
+    time_offset = eqtime + 4.0 * lon_deg
+    tst = hr_utc * 60.0 + time_offset
+    ha = np.deg2rad((tst / 4.0) - 180.0)
+    sin_el = np.sin(lat_rad) * np.sin(decl) + np.cos(lat_rad) * np.cos(decl) * np.cos(ha)
+    sin_el = np.maximum(0.0, sin_el)
+
+    frac_year = hours_utc.year.values + (doy - 1.0) / 365.25
+    years_since_2017 = np.clip(frac_year - 2017.0, 0.0, 12.0)
+    ct_pv_cap_mw = 420.0 + 75.0 * years_since_2017 + 3.2 * (years_since_2017 ** 2)
+
+    sol = np.clip(np.nan_to_num(np.asarray(solar_wm2, dtype=float), nan=0.0), 0.0, 1100.0)
+    cf = np.clip(np.nan_to_num(np.asarray(cloud_pct, dtype=float), nan=50.0) / 100.0, 0.0, 1.0)
+    direct_boost = 1.0 + 0.15 * (1.0 - cf) * np.clip(sin_el / 0.5, 0.0, 1.2)
+    t_arr = np.nan_to_num(np.asarray(temp_f, dtype=float), nan=60.0)
+    temp_derate = np.clip(1.0 - 0.0022 * np.maximum(0.0, t_arr - 70.0), 0.85, 1.05)
+
+    est_gen_mw = ct_pv_cap_mw * (sol / 1000.0) * direct_boost * temp_derate
+    est_gen_mw = np.where(sin_el > 0.01, est_gen_mw, 0.0)
+    return np.round(sin_el, 4), np.round(est_gen_mw, 1)
 
 
 def ensure_weather_columns(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame) -> pd.DataFrame:
@@ -158,21 +201,30 @@ def get_day_regime(loc: pd.DatetimeIndex) -> np.ndarray:
 
 
 def init_knn_buckets(ref_df: pd.DataFrame):
-    global BUCKETS
+    global BUCKETS, OBS_CLOUD_SERIES, OBS_SOLGEN_SERIES
+    ref_df = ensure_weather_columns(ref_df.index, ref_df)
+    _, est_gen = compute_solar_geometry_and_gen(
+        ref_df.index, ref_df["solar_wm2"].values, ref_df["cloud_cover_pct"].values, ref_df["temp_f"].values
+    )
+    ref_df["est_solar_gen_mw"] = est_gen
+    OBS_CLOUD_SERIES = ref_df["cloud_cover_pct"].sort_index()
+    OBS_SOLGEN_SERIES = ref_df["est_solar_gen_mw"].sort_index()
+
     ref_loc = pd.DatetimeIndex(ref_df.index).tz_convert("America/New_York")
     ref_h = ref_loc.hour.values
     ref_reg = get_day_regime(ref_loc)
     ref_vecs = encode_weather_vec(ref_df.index, ref_df)
     ref_loads = ref_df["load_mw"].values.astype(np.float32)
+    ref_solgen = ref_df["est_solar_gen_mw"].values.astype(np.float32)
     ref_t_sec = pd.DatetimeIndex(ref_df.index).as_unit("s").asi8.astype(np.int64)
     BUCKETS = {}
     for h in range(24):
         for reg in (0, 1, 2):
             mask = (ref_h == h) & (ref_reg == reg)
-            BUCKETS[(h, reg)] = (ref_t_sec[mask], ref_vecs[mask], ref_loads[mask])
+            BUCKETS[(h, reg)] = (ref_t_sec[mask], ref_vecs[mask], ref_loads[mask], ref_solgen[mask])
 
 
-def compute_knn_weather_load(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame,
+def compute_knn_weather_load(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame, q_solgen: np.ndarray = None,
                              k_neighbors: int = 15, max_years_back: float = 4.0, recency_tau_years: float = 2.5) -> np.ndarray:
     hours_utc = pd.DatetimeIndex(hours_utc)
     if not BUCKETS:
@@ -180,7 +232,13 @@ def compute_knn_weather_load(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFra
     loc = hours_utc.tz_convert("America/New_York")
     h_arr = loc.hour.values
     reg_arr = get_day_regime(loc)
-    q_vecs = encode_weather_vec(hours_utc, weather_df)
+    w_ens = ensure_weather_columns(hours_utc, weather_df)
+    if q_solgen is None:
+        _, q_solgen = compute_solar_geometry_and_gen(
+            hours_utc, w_ens["solar_wm2"].values, w_ens["cloud_cover_pct"].values, w_ens["temp_f"].values
+        )
+    q_solgen = np.asarray(q_solgen, dtype=np.float32)
+    q_vecs = encode_weather_vec(hours_utc, w_ens)
     q_t_sec = hours_utc.as_unit("s").asi8.astype(np.int64)
 
     knn_mean = np.full(len(hours_utc), np.nan, dtype=np.float64)
@@ -200,8 +258,9 @@ def compute_knn_weather_load(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFra
             q_idx = q_idx[valid_q]
             qv = qv[valid_q]
             qt = q_t_sec[q_idx]
+            qs = q_solgen[q_idx][:, None]
 
-            bt, bv, bl = BUCKETS[(h, reg)]
+            bt, bv, bl, bs = BUCKETS[(h, reg)]
             q_norm2 = np.sum(qv * qv, axis=1, keepdims=True)
             b_norm2 = np.sum(bv * bv, axis=1, keepdims=True).T
             d2 = np.maximum(0.0, q_norm2 + b_norm2 - 2.0 * (qv @ bv.T))
@@ -216,6 +275,7 @@ def compute_knn_weather_load(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFra
             top_d2 = d2[row_idx, part_idx]
             top_dt = dt[row_idx, part_idx]
             top_loads = bl[part_idx]
+            top_sol = bs[part_idx]
 
             has_valid = np.isfinite(top_d2).any(axis=1)
             dists = np.sqrt(np.where(np.isfinite(top_d2), top_d2, 1e9))
@@ -224,7 +284,9 @@ def compute_knn_weather_load(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFra
             w_sum = np.sum(w, axis=1, keepdims=True)
             w_norm = np.where(w_sum > 0, w / w_sum, 0.0)
 
-            mean_val = np.sum(w_norm * top_loads, axis=1)
+            # Duck-Curve-adjusted neighbor load: adjusts historical neighbor load for difference in CT solar PV MW
+            adj_loads = top_loads + DUCK_BETA * (top_sol - qs)
+            mean_val = np.sum(w_norm * adj_loads, axis=1)
             knn_mean[q_idx[has_valid]] = mean_val[has_valid]
 
     return knn_mean
@@ -268,23 +330,53 @@ def make_features(hours_utc, weather, load):
     for column in WEATHER + KNN_EXTRA_COLS:
         out[column] = w_ens[column].values
 
-    # 1D lag: same hour yesterday. If that hour isn't over yet (only the last hour of a live forecast),
-    # use the hour just before it.
+    # Solar energy entering the CT grid (est_solar_gen_mw)
+    _, est_gen = compute_solar_geometry_and_gen(
+        hours_utc, out["solar_wm2"].values, out["cloud_cover_pct"].values, out["temp_f"].values
+    )
+    out["est_solar_gen_mw"] = est_gen
+
+    # Observed cloud cover & solar generation 24h ago (fallback 25h ago if 24h not yet over)
+    cloud_src = OBS_CLOUD_SERIES if len(OBS_CLOUD_SERIES) > 0 else w_ens["cloud_cover_pct"]
+    solgen_src = OBS_SOLGEN_SERIES if len(OBS_SOLGEN_SERIES) > 0 else pd.Series(est_gen, index=hours_utc)
+
+    cc_24 = cloud_src.reindex(hours_utc - pd.Timedelta(hours=24)).values
+    cc_25 = cloud_src.reindex(hours_utc - pd.Timedelta(hours=25)).values
+    cc_obs_24 = np.where(np.isnan(cc_24), cc_25, cc_24)
+    cc_obs_24 = pd.Series(cc_obs_24, index=hours_utc).ffill().bfill().fillna(out["cloud_cover_pct"]).values
+    out["cloud_cover_obs_24h_pct"] = np.round(cc_obs_24, 1)
+    out["cloud_cover_diff_24h_pct"] = np.round(out["cloud_cover_pct"].values - out["cloud_cover_obs_24h_pct"].values, 1)
+
+    sg_24 = solgen_src.reindex(hours_utc - pd.Timedelta(hours=24)).values
+    sg_25 = solgen_src.reindex(hours_utc - pd.Timedelta(hours=25)).values
+    sgen_24 = np.nan_to_num(np.where(np.isnan(sg_24), sg_25, sg_24), nan=0.0)
+    out["solar_gen_diff_24h_mw"] = np.round(est_gen - sgen_24, 1)
+
+    # 1D lag (Duck-Curve adjusted): same hour yesterday, adjusted for difference in solar PV entering the grid
     yesterday = load.reindex(hours_utc - pd.Timedelta(hours=24)).values
     hour_before = load.reindex(hours_utc - pd.Timedelta(hours=25)).values
-    out["load_yesterday_mw"] = np.where(np.isnan(yesterday), hour_before, yesterday)
+    load_1d_raw = np.where(np.isnan(yesterday), hour_before, yesterday)
+    out["load_yesterday_mw"] = np.round(load_1d_raw + DUCK_BETA * (sgen_24 - est_gen), 1)
 
-    # 7D lag: same day of week 1 week ago
-    out["load_7d_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, days=7)).values
+    # 7D lag (Duck-Curve adjusted): same day of week 1 week ago
+    idx_7d = lagged_same_dow_utc(hours_utc, days=7)
+    sgen_7d = np.nan_to_num(solgen_src.reindex(idx_7d).values, nan=0.0)
+    out["load_7d_mw"] = np.round(load.reindex(idx_7d).values + DUCK_BETA * (sgen_7d - est_gen), 1)
 
-    # 1M lag: 1 calendar month prior, same day of week (leap-year aware)
-    out["load_1m_dow_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, months=1)).values
+    # 1M lag (Duck-Curve adjusted): 1 calendar month prior, same day of week (leap-year aware)
+    idx_1m = lagged_same_dow_utc(hours_utc, months=1)
+    sgen_1m = np.nan_to_num(solgen_src.reindex(idx_1m).values, nan=0.0)
+    out["load_1m_dow_mw"] = np.round(load.reindex(idx_1m).values + DUCK_BETA * (sgen_1m - est_gen), 1)
 
-    # 1Y lag: 1 calendar year prior, same day of week (leap-year aware)
-    out["load_1y_dow_mw"] = load.reindex(lagged_same_dow_utc(hours_utc, years=1)).values
+    # 1Y lag (Duck-Curve adjusted): 1 calendar year prior, same day of week (leap-year aware)
+    idx_1y = lagged_same_dow_utc(hours_utc, years=1)
+    sgen_1y = np.nan_to_num(solgen_src.reindex(idx_1y).values, nan=0.0)
+    out["load_1y_dow_mw"] = np.round(load.reindex(idx_1y).values + DUCK_BETA * (sgen_1y - est_gen), 1)
 
-    # KNN weather-analog load: weighted mean load of the 15 closest past weather-analog hours
-    out["knn_weather_load_mw"] = np.round(compute_knn_weather_load(hours_utc, out[WEATHER + KNN_EXTRA_COLS]), 1)
+    # KNN weather-analog load (Duck-Curve adjusted): weighted mean load of the 15 closest past weather-analog hours
+    out["knn_weather_load_mw"] = np.round(
+        compute_knn_weather_load(hours_utc, out[WEATHER + KNN_EXTRA_COLS], q_solgen=est_gen), 1
+    )
     return out[FEATURES]
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -338,7 +430,7 @@ def forecast_range(bucket, card, X, preds, targets):
 
 def fill_inputs(X, load):
     """Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load."""
-    X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
+    X[WEATHER + DUCK_CURVE_FEATURES] = X[WEATHER + DUCK_CURVE_FEATURES].interpolate(limit_direction="both").fillna(0.0)
     if "knn_weather_load_mw" in X.columns and X["knn_weather_load_mw"].isna().any():
         X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
@@ -425,7 +517,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
 
 
 def run_once(dry_run: bool = False) -> dict:
-    global LATEST_REGIONAL
+    global LATEST_REGIONAL, OBS_CLOUD_SERIES, OBS_SOLGEN_SERIES
     bucket = storage.Client(project=PROJECT_ID).bucket(GCS_BUCKET)
     if not bucket.blob(MODEL_KEY).exists():
         return {"status": "no_model", "message": f"Upload your model to gs://{GCS_BUCKET}/{MODEL_KEY} (Lab 5, Part 7)."}
@@ -451,7 +543,7 @@ def run_once(dry_run: bool = False) -> dict:
     load_table["hour_utc"] = pd.to_datetime(load_table["hour_utc"], utc=True)
     load = load_table.set_index("hour_utc")["load_mw_5min_avg"].sort_index()
 
-    # Load historical weather + load reference archive (2017-2026) + live observed weather for KNN weather analogs
+    # Load historical weather + load reference archive (2017-2026) + live observed weather for KNN weather analogs & 24h cloud/solar lags
     ref_table = read_csv(bucket, KNN_REF_KEY)
     if ref_table is not None and len(ref_table) > 0:
         ref_table["hour_utc"] = pd.to_datetime(ref_table["hour_utc"], utc=True)
@@ -464,10 +556,17 @@ def run_once(dry_run: bool = False) -> dict:
             obs_df = obs_table.set_index("hour_utc").sort_index()
             obs_df = ensure_weather_columns(obs_df.index, obs_df)
             obs_df["load_mw"] = load.reindex(obs_df.index)
-            obs_df = obs_df.dropna(subset=BASE_WEATHER + ["load_mw"])
+            obs_df = obs_df.dropna(subset=BASE_WEATHER)
             ref_df = pd.concat([ref_df, obs_df])
             ref_df = ref_df[~ref_df.index.duplicated(keep="last")].sort_index()
-        init_knn_buckets(ref_df)
+        # Keep all hours for OBS_CLOUD_SERIES / OBS_SOLGEN_SERIES, and hours with non-null load_mw for KNN buckets
+        init_knn_buckets(ref_df.dropna(subset=["load_mw"]))
+        # Also extend OBS_CLOUD_SERIES and OBS_SOLGEN_SERIES with any very recent observed hours whose load isn't finalized yet
+        _, all_est_gen = compute_solar_geometry_and_gen(
+            ref_df.index, ref_df["solar_wm2"].values, ref_df["cloud_cover_pct"].values, ref_df["temp_f"].values
+        )
+        OBS_CLOUD_SERIES = ref_df["cloud_cover_pct"].sort_index()
+        OBS_SOLGEN_SERIES = pd.Series(all_est_gen, index=ref_df.index).sort_index()
 
     now = datetime.now(timezone.utc)
     this_hour = pd.Timestamp(now).floor("h")
@@ -477,7 +576,7 @@ def run_once(dry_run: bool = False) -> dict:
 
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load
     filled_weather = int(X[BASE_WEATHER].isna().sum().sum())
-    X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
+    X[WEATHER + DUCK_CURVE_FEATURES] = X[WEATHER + DUCK_CURVE_FEATURES].interpolate(limit_direction="both").fillna(0.0)
     if X["knn_weather_load_mw"].isna().any():
         X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
     filled_load = int(X[LOAD_LAGS + ["knn_weather_load_mw"]].isna().sum().sum())
