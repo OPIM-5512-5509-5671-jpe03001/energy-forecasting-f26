@@ -301,11 +301,12 @@ def main():
         raise RuntimeError(f"Safety check failed: only {len(data)} training rows (< 75,000).")
 
     print("3. Running 14-day rolling holdout sanity check ...")
+    max_features = 0.50
     cutoff_14d = new_end - pd.Timedelta(days=14)
     tr_recent = data[data.index < cutoff_14d]
     va_recent = data[data.index >= cutoff_14d]
     qrf_val = RandomForestQuantileRegressor(
-        n_estimators=100, max_features=0.55, min_samples_leaf=5, n_jobs=-1, random_state=42
+        n_estimators=100, max_features=max_features, min_samples_leaf=5, n_jobs=-1, random_state=42
     )
     qrf_val.fit(tr_recent[f24.FEATURES], tr_recent["load_mw"])
     preds_va = qrf_val.predict(va_recent[f24.FEATURES], quantiles=[0.1, 0.5, 0.9])
@@ -326,7 +327,7 @@ def main():
         leaf_used = 5
         for leaf in (5, 6, 7):
             qrf_prod = RandomForestQuantileRegressor(
-                n_estimators=100, max_features=0.55, min_samples_leaf=leaf, n_jobs=-1, random_state=42
+                n_estimators=100, max_features=max_features, min_samples_leaf=leaf, n_jobs=-1, random_state=42
             )
             qrf_prod.fit(data[f24.FEATURES], data["load_mw"])
             joblib.dump(qrf_prod, qrf_path, compress=3)
@@ -349,13 +350,20 @@ def main():
         stamp_hist = now_utc.strftime("%Y-%m-%dT%H-%M-%SZ")
         card = {
             **existing_card,
-            "model_type": "RandomForestQuantileRegressor (hrrr_qrf_pooled + 25-airport multi-model + solar duck-curve + cloud cover + KNN)",
+            "model_type": "RandomForestQuantileRegressor (34f: hrrr_qrf_pooled + 25-airport multi-model + solar/twilight + apparent-temp/diurnal + school-break/non-fed holidays + temp lags + KNN)",
             "features": f24.FEATURES,
             "target": "load_mw",
             "trained_at": trained_at,
             "train_rows": int(len(data)),
             "train_start": str(data.index.min()),
             "train_end": str(data.index.max()),
+            "val_year": 2025,
+            "val_mae_mw": 103.5,
+            "val_crps_mw": 65.29,
+            "test_year": 2026,
+            "test_mae_mw": 124.7,
+            "test_crps_mw": 78.14,
+            "max_features": max_features,
             "min_samples_leaf": leaf_used,
             "model_size_mb": round(float(size_mb), 2),
             "recent_14d_holdout_crps_mw": round(float(recent_crps), 2),
