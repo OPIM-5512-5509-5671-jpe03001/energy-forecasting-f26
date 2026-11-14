@@ -288,7 +288,7 @@ def main():
     added_hours = int((ref_df.index > prev_end).sum())
     print(f"   Reference archive: {len(ref_df):,} hours ({ref_df.index.min()} -> {new_end}, +{added_hours} new hours)")
 
-    print("2. Building 21-feature matrix via forecast-24h/main.py ...")
+    print(f"2. Building {len(f24.FEATURES)}-feature matrix via forecast-24h/main.py ...")
     f24.init_knn_buckets(ref_df)
     load_s = ref_df["load_mw"].copy()
     target_idx = ref_df.index[ref_df.index >= "2018-01-01 00:00:00+00:00"]
@@ -320,7 +320,7 @@ def main():
     if not np.isfinite(recent_crps) or recent_crps > 160.0:
         raise RuntimeError(f"Safety check failed: recent 14d CRPS {recent_crps:.2f} MW exceeds 160 MW limit!")
 
-    print(f"4. Training production 21-feature QRF on ALL {len(data):,} hours ...")
+    print(f"4. Training production {len(f24.FEATURES)}-feature QRF on ALL {len(data):,} hours ...")
     with tempfile.TemporaryDirectory() as tmpdir:
         qrf_path = os.path.join(tmpdir, "model_qrf.joblib")
         leaf_used = 5
