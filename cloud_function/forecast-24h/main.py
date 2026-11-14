@@ -72,10 +72,20 @@ WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_
            "solar_wm2", "ct_coast_inland_temp_diff_f"]
 TEMP_LAG_FEATURES = ["temp_lag_3h_f", "temp_lag_24h_f", "temp_mean_24h_f", "dewpoint_mean_24h_f"]
 DUCK_CURVE_FEATURES = ["est_solar_gen_mw", "cloud_cover_obs_24h_pct", "cloud_cover_diff_24h_pct", "solar_gen_diff_24h_mw"]
+PHYSICS_SOLAR_FEATURES = [
+    "apparent_temp_f",
+    "temp_min_24h_f",
+    "temp_range_24h_f",
+    "sin_sun_elev",
+    "hours_after_sunset",
+    "sin_doy",
+    "cos_doy",
+]
+ALL_WEATHER_FEATURES = WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES + PHYSICS_SOLAR_FEATURES
 KNN_EXTRA_COLS = ["west_east_temp_diff_f"]
-CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday", "is_non_fed_holiday"]
+CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday", "is_non_fed_holiday", "is_school_break"]
 LOAD_LAGS = ["load_yesterday_mw", "load_7d_mw", "load_1m_dow_mw", "load_1y_dow_mw"]
-FEATURES = CALENDAR + WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES + LOAD_LAGS + ["knn_weather_load_mw"]
+FEATURES = CALENDAR + WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES + PHYSICS_SOLAR_FEATURES + LOAD_LAGS + ["knn_weather_load_mw"]
 DUCK_BETA = 0.55
 HOLIDAYS = USFederalHolidayCalendar().holidays(start="2015-01-01", end="2030-12-31")
 
@@ -94,10 +104,10 @@ def _easter_sunday(year: int) -> date:
     return date(year, month, day)
 
 
-def _build_non_fed_holidays(start_year: int = 2015, end_year: int = 2031) -> set:
-    """Connecticut commercial/school non-federal holiday weekdays with significant grid load drops."""
+def _build_special_calendar_dates(start_year: int = 2015, end_year: int = 2031) -> tuple:
+    """Returns (non_fed_holidays, school_break_days) for CT commercial and school calendar load shifts."""
     fed = set(pd.DatetimeIndex(HOLIDAYS).date)
-    dates = set()
+    non_fed, school_break = set(), set()
     for y in range(start_year, end_year):
         nov1 = date(y, 11, 1)
         thanksgiving = nov1 + timedelta(days=((3 - nov1.weekday()) % 7) + 21)
@@ -106,11 +116,19 @@ def _build_non_fed_holidays(start_year: int = 2015, end_year: int = 2031) -> set
         black_friday = thanksgiving + timedelta(days=1)
         for d in (good_friday, election_day, black_friday, date(y, 12, 24), date(y, 12, 31)):
             if d.weekday() < 5 and d not in fed:
-                dates.add(d)
-    return dates
+                non_fed.add(d)
+        # Thanksgiving Mon-Wed & Christmas-week weekdays Dec 26-30
+        for d in (thanksgiving - timedelta(days=3), thanksgiving - timedelta(days=2), thanksgiving - timedelta(days=1)):
+            if d.weekday() < 5 and d not in fed:
+                school_break.add(d)
+        for day_num in range(26, 31):
+            d = date(y, 12, day_num)
+            if d.weekday() < 5 and d not in fed:
+                school_break.add(d)
+    return non_fed, school_break
 
 
-NON_FED_HOLIDAYS = _build_non_fed_holidays()
+NON_FED_HOLIDAYS, SCHOOL_BREAK_DAYS = _build_special_calendar_dates()
 
 # Empirical mean, std, and feature weights for 10-variable + seasonal KNN weather-analog matcher:
 # [temp_f, dewpoint_f, rel_humidity_pct, wind_speed_mph, cloud_cover_pct, cdd, hdd,
@@ -126,9 +144,10 @@ OBS_TEMP_SERIES = pd.Series(dtype=float)
 OBS_DEWP_SERIES = pd.Series(dtype=float)
 
 
-def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) -> np.ndarray:
-    """Physical clear-sky solar irradiance at BDL (41.9389N, -72.6832W) attenuated by cloud cover."""
+def _solar_astronomy(hours_utc: pd.DatetimeIndex) -> tuple:
+    """Computes (sin_el, doy_utc, hours_after_sunset, loc_doy) at BDL (41.9389N, -72.6832W)."""
     hours_utc = pd.DatetimeIndex(hours_utc)
+    loc = hours_utc.tz_convert("America/New_York")
     lat_rad = np.deg2rad(41.9389)
     lon_deg = -72.6832
     doy = hours_utc.dayofyear.values
@@ -142,8 +161,21 @@ def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) 
     time_offset = eqtime + 4.0 * lon_deg
     tst = hr_utc * 60.0 + time_offset
     ha = np.deg2rad((tst / 4.0) - 180.0)
-    sin_el = np.sin(lat_rad) * np.sin(decl) + np.cos(lat_rad) * np.cos(decl) * np.cos(ha)
-    sin_el = np.maximum(0.0, sin_el)
+    sin_el = np.maximum(0.0, np.sin(lat_rad) * np.sin(decl) + np.cos(lat_rad) * np.cos(decl) * np.cos(ha))
+
+    zenith = np.deg2rad(90.833)
+    cos_ha_ss = np.clip((np.cos(zenith) / (np.cos(lat_rad) * np.cos(decl))) - np.tan(lat_rad) * np.tan(decl), -1.0, 1.0)
+    ha_ss_deg = np.rad2deg(np.arccos(cos_ha_ss))
+    sunset_utc_min = 720.0 - 4.0 * (lon_deg - ha_ss_deg) - eqtime
+    utc_offset_hrs = np.asarray((loc.tz_localize(None) - hours_utc.tz_localize(None)).total_seconds(), dtype=float) / 3600.0
+    sunset_local_hr = (sunset_utc_min / 60.0) + utc_offset_hrs
+    hours_after_sunset = (loc.hour.values + 0.5) - sunset_local_hr
+    return sin_el, doy, hours_after_sunset, loc.dayofyear.values
+
+
+def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) -> np.ndarray:
+    """Physical clear-sky solar irradiance at BDL (41.9389N, -72.6832W) attenuated by cloud cover."""
+    sin_el, _, _, _ = _solar_astronomy(hours_utc)
     clear_sky = 1020.0 * (sin_el ** 1.15)
     cf = np.clip(np.nan_to_num(np.asarray(cloud_pct, dtype=float), nan=50.0) / 100.0, 0.0, 1.0)
     atten = 1.0 - 0.68 * (cf ** 2.0)
@@ -152,25 +184,11 @@ def compute_clear_sky_solar(hours_utc: pd.DatetimeIndex, cloud_pct: np.ndarray) 
 
 def compute_solar_geometry_and_gen(hours_utc: pd.DatetimeIndex, solar_wm2: np.ndarray,
                                    cloud_pct: np.ndarray, temp_f: np.ndarray) -> tuple:
-    """Computes (sin_sun_elev, est_solar_gen_mw) representing the estimated MW of solar PV
+    """Computes (sin_sun_elev, est_solar_gen_mw) representing estimated MW of solar PV
     entering the Connecticut grid during daytime hours, accounting for CT BTM PV capacity growth (2017->2026),
     shortwave irradiance (W/m2), cloud cover attenuation, and panel temperature derating."""
     hours_utc = pd.DatetimeIndex(hours_utc)
-    lat_rad = np.deg2rad(41.9389)
-    lon_deg = -72.6832
-    doy = hours_utc.dayofyear.values
-    hr_utc = hours_utc.hour.values - 0.5
-    gamma = 2.0 * np.pi / 365.25 * (doy - 1 + (hr_utc - 12.0) / 24.0)
-    eqtime = 229.18 * (0.000075 + 0.001868 * np.cos(gamma) - 0.032077 * np.sin(gamma)
-                       - 0.014615 * np.cos(2 * gamma) - 0.040849 * np.sin(2 * gamma))
-    decl = (0.006918 - 0.399912 * np.cos(gamma) + 0.070257 * np.sin(gamma)
-            - 0.006758 * np.cos(2 * gamma) + 0.000907 * np.sin(2 * gamma)
-            - 0.002697 * np.cos(3 * gamma) + 0.00148 * np.sin(3 * gamma))
-    time_offset = eqtime + 4.0 * lon_deg
-    tst = hr_utc * 60.0 + time_offset
-    ha = np.deg2rad((tst / 4.0) - 180.0)
-    sin_el = np.sin(lat_rad) * np.sin(decl) + np.cos(lat_rad) * np.cos(decl) * np.cos(ha)
-    sin_el = np.maximum(0.0, sin_el)
+    sin_el, doy, _, _ = _solar_astronomy(hours_utc)
 
     frac_year = hours_utc.year.values + (doy - 1.0) / 365.25
     years_since_2017 = np.clip(frac_year - 2017.0, 0.0, 12.0)
@@ -182,9 +200,32 @@ def compute_solar_geometry_and_gen(hours_utc: pd.DatetimeIndex, solar_wm2: np.nd
     t_arr = np.nan_to_num(np.asarray(temp_f, dtype=float), nan=60.0)
     temp_derate = np.clip(1.0 - 0.0022 * np.maximum(0.0, t_arr - 70.0), 0.85, 1.05)
 
-    est_gen_mw = ct_pv_cap_mw * (sol / 1000.0) * direct_boost * temp_derate
-    est_gen_mw = np.where(sin_el > 0.01, est_gen_mw, 0.0)
+    est_gen_mw = np.where(sin_el > 0.01, ct_pv_cap_mw * (sol / 1000.0) * direct_boost * temp_derate, 0.0)
     return np.round(sin_el, 4), np.round(est_gen_mw, 1)
+
+
+def compute_twilight_and_doy(hours_utc: pd.DatetimeIndex) -> tuple:
+    """Returns (hours_after_sunset, sin_doy, cos_doy) capturing dusk lighting transitions and annual daylight cycle."""
+    _, _, hours_after_sunset, loc_doy = _solar_astronomy(hours_utc)
+    doy_rad = 2.0 * np.pi * (loc_doy - 1.0) / 365.25
+    return (
+        np.round(hours_after_sunset, 2),
+        np.round(np.sin(doy_rad), 4),
+        np.round(np.cos(doy_rad), 4),
+    )
+
+
+def compute_apparent_temp(temp_f: np.ndarray, rh_pct: np.ndarray, wind_mph: np.ndarray) -> np.ndarray:
+    """Computes NWS Wind Chill (T <= 50F, v >= 3 mph) and Rothfusz Heat Index (T >= 80F)."""
+    t = np.asarray(temp_f, dtype=float)
+    rh = np.clip(np.nan_to_num(np.asarray(rh_pct, dtype=float), nan=50.0), 0.0, 100.0)
+    v = np.maximum(0.1, np.nan_to_num(np.asarray(wind_mph, dtype=float), nan=5.0))
+    wc = np.where((t <= 50.0) & (v >= 3.0), 35.74 + 0.6215 * t - 35.75 * (v ** 0.16) + 0.4275 * t * (v ** 0.16), t)
+    hi = (-42.379 + 2.04901523 * t + 10.14333127 * rh - 0.22475541 * t * rh
+          - 0.00683783 * t * t - 0.05481717 * rh * rh + 0.00122874 * t * t * rh
+          + 0.00085282 * t * rh * rh - 0.00000199 * t * t * rh * rh)
+    at = np.where(t >= 80.0, np.maximum(t, hi), wc)
+    return np.round(at, 1)
 
 
 def ensure_weather_columns(hours_utc: pd.DatetimeIndex, weather_df: pd.DataFrame) -> pd.DataFrame:
@@ -365,12 +406,13 @@ def make_features(hours_utc, weather, load):
     out["is_weekend"] = (local.dayofweek >= 5).astype(int)
     out["is_holiday"] = local.tz_localize(None).normalize().isin(HOLIDAYS).astype(int)
     out["is_non_fed_holiday"] = np.array([1 if d in NON_FED_HOLIDAYS else 0 for d in local.date], dtype=int)
+    out["is_school_break"] = np.array([1 if d in SCHOOL_BREAK_DAYS else 0 for d in local.date], dtype=int)
 
     w_ens = ensure_weather_columns(hours_utc, weather)
     for column in WEATHER + KNN_EXTRA_COLS:
         out[column] = w_ens[column].values
 
-    # Causal temperature & dewpoint time-series lags: observed past weather stitched to current forecast trajectory
+    # Causal temperature & dewpoint time-series lags + 24h diurnal thermal envelope
     w_clean = weather[~weather.index.duplicated(keep="last")].sort_index()
     full_grid = pd.date_range(hours_utc.min() - pd.Timedelta(hours=24), hours_utc.max(), freq="h", tz="UTC")
     obs_t = OBS_TEMP_SERIES[~OBS_TEMP_SERIES.index.duplicated(keep="last")] if len(OBS_TEMP_SERIES) > 0 else pd.Series(dtype=float)
@@ -383,12 +425,24 @@ def make_features(hours_utc, weather, load):
     out["temp_lag_24h_f"] = np.round(s_t.reindex(hours_utc - pd.Timedelta(hours=24)).values, 1)
     out["temp_mean_24h_f"] = np.round(s_t.rolling(24, min_periods=1).mean().reindex(hours_utc).values, 1)
     out["dewpoint_mean_24h_f"] = np.round(s_d.rolling(24, min_periods=1).mean().reindex(hours_utc).values, 1)
+    t_min_24h = s_t.rolling(24, min_periods=1).min().reindex(hours_utc).values
+    t_max_24h = s_t.rolling(24, min_periods=1).max().reindex(hours_utc).values
+    out["temp_min_24h_f"] = np.round(t_min_24h, 1)
+    out["temp_range_24h_f"] = np.round(t_max_24h - t_min_24h, 1)
 
-    # Solar energy entering the CT grid (est_solar_gen_mw)
-    _, est_gen = compute_solar_geometry_and_gen(
+    # Physics comfort & solar geometry / dusk timing / annual cycle transforms
+    out["apparent_temp_f"] = compute_apparent_temp(
+        out["temp_f"].values, out["rel_humidity_pct"].values, out["wind_speed_mph"].values
+    )
+    sin_el, est_gen = compute_solar_geometry_and_gen(
         hours_utc, out["solar_wm2"].values, out["cloud_cover_pct"].values, out["temp_f"].values
     )
+    hrs_after_ss, sin_doy, cos_doy = compute_twilight_and_doy(hours_utc)
+    out["sin_sun_elev"] = sin_el
     out["est_solar_gen_mw"] = est_gen
+    out["hours_after_sunset"] = hrs_after_ss
+    out["sin_doy"] = sin_doy
+    out["cos_doy"] = cos_doy
 
     # Observed cloud cover & solar generation 24h ago (fallback 25h ago if 24h not yet over)
     cloud_src = OBS_CLOUD_SERIES if len(OBS_CLOUD_SERIES) > 0 else w_ens["cloud_cover_pct"]
@@ -484,7 +538,7 @@ def forecast_range(bucket, card, X, preds, targets):
 
 def fill_inputs(X, load):
     """Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load."""
-    w_all = WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES
+    w_all = ALL_WEATHER_FEATURES
     X[w_all] = X[w_all].interpolate(limit_direction="both").fillna(0.0)
     if "knn_weather_load_mw" in X.columns and X["knn_weather_load_mw"].isna().any():
         X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
@@ -633,7 +687,7 @@ def run_once(dry_run: bool = False) -> dict:
 
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing load lag takes yesterday's or the newest load
     filled_weather = int(X[BASE_WEATHER].isna().sum().sum())
-    w_all = WEATHER + TEMP_LAG_FEATURES + DUCK_CURVE_FEATURES
+    w_all = ALL_WEATHER_FEATURES
     X[w_all] = X[w_all].interpolate(limit_direction="both").fillna(0.0)
     if X["knn_weather_load_mw"].isna().any():
         X["knn_weather_load_mw"] = np.round(compute_knn_weather_load(X.index, X), 1)
