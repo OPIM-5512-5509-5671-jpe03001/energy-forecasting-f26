@@ -1,0 +1,66 @@
+name: Pipeline Health Check
+# Monitors every 6 hours that all scrapers, forecast-24h, HRRR feed, Cloud Scheduler
+# jobs, model freshness/size, and GCS bucket permissions are healthy and up to date.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 */6 * * *"   # Every 6 hours at :30 (after :05/:15/:20 jobs finish)
+  pull_request:
+    paths:
+      - "cloud_function/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ vars.PROJECT_ID }}
+  REGION: ${{ vars.REGION }}
+  BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+  ENERGY_PREFIX: energy
+  DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+  WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+
+jobs:
+  health-check:
+    if: github.repository_owner != 'drdave-teaching'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "cloud_function/forecast-24h/requirements.txt"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-cloud-storage pandas numpy requests joblib quantile-forest==1.4.2 scikit-learn==1.6.1
+
+      - name: Auth (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Run full pipeline health checks
+        run: |
+          python scripts/health_check.py \
+            --project "${PROJECT_ID}" \
+            --bucket "${BUCKET_NAME}" \
+            --region "${REGION}" \
+            --prefix "${ENERGY_PREFIX}" \
+            --check-gcp
