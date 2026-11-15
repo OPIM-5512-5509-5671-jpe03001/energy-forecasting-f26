@@ -9,6 +9,9 @@
 #   4. adds a low and high value (an 80% range: 10th and 90th percentiles) if your model card says how (Lab 6):
 #        "range_method": "quantile_models"  -> two more models, energy/models/model_low.joblib and model_high.joblib
 #        "range_method": "offsets_by_hour"  -> "range_offsets_mw": {"low": [24 MW], "high": [24 MW]}, by Connecticut hour
+#        "range_method": "quantile_forest"  -> Final project: energy/models/model_qrf.joblib (a quantile forest) fed the
+#                                              NWS forecast only; low, expected and high = its 10th, 50th and 90th
+#                                              percentiles (the simple path: no HRRR)
 #        "range_method": "hrrr_qrf_pooled"  -> Lab 6C: energy/models/model_qrf.joblib (a quantile forest) on EVERY recent HRRR
 #                                              run that covers each hour (weather uncertainty), pooled into one low,
 #                                              expected and high. HRRR runs come from Dr. Dave's class file (HRRR_RUNS_URL);
@@ -167,6 +170,25 @@ def hrrr_run_tables(card, now):
     return tables
 
 
+def forest_range(bucket, card, X):
+    """Final project: the quantile forest on the NWS forecast only. Low, expected and high are its 10th, 50th and 90th
+    percentiles for each hour, then range_widen stretches low and high around the expected value.
+    Returns (low, expected, high)."""
+    if not bucket.blob(QRF_MODEL_KEY).exists():
+        raise ValueError("Your model card says quantile_forest, but energy/models/model_qrf.joblib is missing.")
+    qrf = joblib.load(io.BytesIO(bucket.blob(QRF_MODEL_KEY).download_as_bytes()))
+    q = qrf.predict(X[FEATURES], quantiles=[0.1, 0.5, 0.9])
+    low = q[:, 0]
+    expected = q[:, 1]
+    high = q[:, 2]
+    widen = float(card.get("range_widen", 1.0))
+    low = expected - widen * (expected - low)
+    high = expected + widen * (high - expected)
+    low = np.minimum(low, expected)
+    high = np.maximum(high, expected)
+    return low, expected, high
+
+
 def pooled_range(bucket, card, targets, load, nws_weather, now):
     """Lab 6C: the quantile forest's 20 percentiles (2.5%, 7.5%, ..., 97.5%) for every HRRR run that covers an hour, pooled
     into one pile per hour; low, expected and high are the 10th, 50th and 90th percentile of the pile ("hazen": each
@@ -258,7 +280,11 @@ def run_once(dry_run: bool = False) -> dict:
     range_error = ""
     pool_info = {}
     try:                         # a broken range never costs you your expected-value forecast
-        if str(card.get("range_method", "none")) == "hrrr_qrf_pooled":
+        if str(card.get("range_method", "none")) == "quantile_forest":
+            low, forest_expected, high = forest_range(bucket, card, X)
+            preds = forest_expected            # the expected value is the forest's median
+            range_method = "quantile_forest"
+        elif str(card.get("range_method", "none")) == "hrrr_qrf_pooled":
             low, pooled_expected, high, pool_info = pooled_range(bucket, card, targets, load, weather, now)
             preds = pooled_expected            # the expected value is the middle of the pooled pile
             range_method = "hrrr_qrf_pooled"
