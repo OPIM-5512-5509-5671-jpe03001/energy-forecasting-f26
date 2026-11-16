@@ -258,22 +258,25 @@ def main():
         card_feats = list(card.get("features", []))
         feats_match = card_feats == list(f24.FEATURES)
         wm = float(card.get("hgbr_weight_median", 0.0))
+        wm_mse = float(card.get("hgbr_weight_mse", 0.0))
         wb = float(card.get("hgbr_weight_bounds", 0.0))
-        needs_hgbr = wm > 0.0 or wb > 0.0
+        needs_hgbr = wm > 0.0 or wm_mse > 0.0 or wb > 0.0
         hgbr_ok = (not needs_hgbr) or hgbr_blob.exists()
         hgbr_info = ""
         if needs_hgbr and hgbr_blob.exists():
             hgbr_blob.reload()
             hgbr_mb = (hgbr_blob.size or 0) / (1024 * 1024)
-            hgbr_info = f", hgbr={hgbr_mb:.2f} MB (wm={wm:.2f}, wb={wb:.2f}, widen={card.get('range_widen', 1.0)})"
+            slope = float(card.get("range_widen_slope", 0.0))
+            widen_s = f"{float(card.get('range_widen', 1.0)):.3f}+{slope:.5f}*h" if slope else f"{card.get('range_widen', 1.0)}"
+            hgbr_info = f", hgbr={hgbr_mb:.2f} MB (wm={wm:.2f}, wm_mse={wm_mse:.2f}, wb={wb:.2f}, widen={widen_s})"
         elif needs_hgbr:
             hgbr_info = ", hgbr=MISSING"
         detail = (
-            f"qrf={size_mb:.2f} MB (<=50){hgbr_info}, trained {age_h:.1f}h ago, "
+            f"qrf={size_mb:.2f} MB (<=150){hgbr_info}, trained {age_h:.1f}h ago, "
             f"rows={card.get('train_rows')}, features_match={feats_match} ({len(card_feats)}/{len(f24.FEATURES)}), "
             f"14d_crps={card.get('recent_14d_holdout_crps_mw', 'n/a')} MW"
         )
-        if size_mb > 50.0 or not feats_match or not hgbr_ok:
+        if size_mb > 150.0 or not feats_match or not hgbr_ok:
             report.add("Model Artifact & Card", "FAIL", detail)
         elif age_h > 36.0:
             report.add("Model Artifact & Card", "WARN", detail + " (retrain >36h old)")

@@ -588,8 +588,8 @@ def _hrrr_table_weight(table, newest_init, weights_cfg):
 
 def pooled_range(bucket, card, targets, load, nws_weather, now):
     """Lab 6C: the quantile forest's 20 percentiles (2.5%, 7.5%, ..., 97.5%) for every HRRR run that covers an hour, pooled
-    into one weighted pile per hour, blended with optional pinball HistGradientBoosting quantiles when present;
-    low, expected and high are the calibrated 10th, 50th and 90th percentiles centered by range_widen.
+    into one weighted pile per hour, blended with optional HGBR pinball + MSE point models when present;
+    low, expected and high are the calibrated 10th, 50th and 90th percentiles scaled by lead-aware range_widen.
     Returns (low, expected, high, info)."""
     if not bucket.blob(QRF_MODEL_KEY).exists():
         raise ValueError("Your model card says hrrr_qrf_pooled, but energy/models/model_qrf.joblib is missing.")
@@ -597,9 +597,10 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
     qrf_cols = list(getattr(qrf, "feature_names_in_", FEATURES))
 
     wm = float(card.get("hgbr_weight_median", 0.0))
+    wm_mse = float(card.get("hgbr_weight_mse", 0.0))
     wb = float(card.get("hgbr_weight_bounds", 0.0))
     hgbr_bundle = None
-    if (wm > 0.0 or wb > 0.0) and bucket.blob(HGBR_MODEL_KEY).exists():
+    if (wm > 0.0 or wm_mse > 0.0 or wb > 0.0) and bucket.blob(HGBR_MODEL_KEY).exists():
         hgbr_bundle = joblib.load(io.BytesIO(bucket.blob(HGBR_MODEL_KEY).download_as_bytes()))
 
     tables = hrrr_run_tables(card, now)
@@ -613,8 +614,8 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
     n_targets = len(targets)
     piles = [[] for _ in range(n_targets)]
     unique_runs = [0] * n_targets
-    hg_qs = (0.1, 0.5, 0.9)
-    hg_sum = {qv: np.zeros(n_targets, dtype=float) for qv in hg_qs}
+    hg_keys = [k for k in ((0.1, 0.5, 0.9) + (("mse",) if wm_mse > 0.0 else ())) if hgbr_bundle is not None and k in hgbr_bundle]
+    hg_sum = {k: np.zeros(n_targets, dtype=float) for k in hg_keys}
     hg_wsum = np.zeros(n_targets, dtype=float)
 
     def _accumulate_table(positions, X_feat, weight):
@@ -624,13 +625,13 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
             for _ in range(weight):
                 piles[pos].extend(q_vals)
             unique_runs[pos] += 1
-        if hgbr_bundle is not None:
-            hg_cols = list(getattr(hgbr_bundle[0.5], "feature_names_in_", qrf_cols))
+        if hgbr_bundle is not None and len(hg_keys) > 0:
+            hg_cols = list(getattr(hgbr_bundle[hg_keys[0]], "feature_names_in_", qrf_cols))
             X_hg = X_feat[hg_cols]
-            for qv in hg_qs:
-                preds = hgbr_bundle[qv].predict(X_hg)
+            for k in hg_keys:
+                preds = hgbr_bundle[k].predict(X_hg)
                 for j, pos in enumerate(positions):
-                    hg_sum[qv][pos] += weight * float(preds[j])
+                    hg_sum[k][pos] += weight * float(preds[j])
             for pos in positions:
                 hg_wsum[pos] += weight
 
@@ -654,6 +655,10 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
     low = np.zeros(n_targets)
     expected = np.zeros(n_targets)
     high = np.zeros(n_targets)
+    has_mse = ("mse" in hg_sum) and (wm_mse > 0.0)
+    wm_mse_eff = wm_mse if has_mse else 0.0
+    wq_exp = max(0.0, 1.0 - wm - wm_mse_eff)
+
     for i in range(n_targets):
         qrf_lo, qrf_exp, qrf_hi = np.quantile(piles[i], [0.1, 0.5, 0.9], method="hazen")
         if hgbr_bundle is not None and hg_wsum[i] > 0.0:
@@ -662,7 +667,8 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
             hg_hi = hg_sum[0.9][i] / hg_wsum[i]
             hg_lo = min(hg_lo, hg_exp)
             hg_hi = max(hg_hi, hg_exp)
-            exp_i = (1.0 - wm) * qrf_exp + wm * hg_exp
+            hg_mse = (hg_sum["mse"][i] / hg_wsum[i]) if has_mse else 0.0
+            exp_i = wq_exp * qrf_exp + wm * hg_exp + wm_mse_eff * hg_mse
             lo_raw = (1.0 - wb) * qrf_lo + wb * hg_lo
             hi_raw = (1.0 - wb) * qrf_hi + wb * hg_hi
         else:
@@ -671,15 +677,20 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
         low[i] = lo_raw
         high[i] = hi_raw
 
-    widen = float(card.get("range_widen", 1.0))
-    low = np.minimum(expected, expected - widen * np.maximum(0.0, expected - low))
-    high = np.maximum(expected, expected + widen * np.maximum(0.0, high - expected))
+    widen_base = float(card.get("range_widen", 1.0))
+    widen_slope = float(card.get("range_widen_slope", 0.0))
+    this_hour = pd.Timestamp(now).floor("h")
+    lead_hours = np.array([max(1.0, (pd.Timestamp(t) - this_hour).total_seconds() / 3600.0) for t in targets], dtype=float)
+    widen_vec = widen_base + widen_slope * lead_hours
+    low = np.minimum(expected, expected - widen_vec * np.maximum(0.0, expected - low))
+    high = np.maximum(expected, expected + widen_vec * np.maximum(0.0, high - expected))
     info = {
         "weather_source": weather_source,
         "hrrr_runs_read": len(tables) if weather_source == "hrrr" else 0,
         "runs_per_hour_min": int(min(unique_runs)) if n_targets > 0 else 0,
         "runs_per_hour_max": int(max(unique_runs)) if n_targets > 0 else 0,
         "hgbr_blended": bool(hgbr_bundle is not None),
+        "hgbr_mse_blended": bool(has_mse),
     }
     return low, expected, high, info
 

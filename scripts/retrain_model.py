@@ -1,10 +1,10 @@
-"""Automated rolling retraining pipeline for the Connecticut 24-hour QRF load model.
+"""Automated rolling retraining pipeline for the Connecticut 24-hour ETQF + HGBR ensemble.
 
 Reads historical reference data + live hourly scraper tables from GCS, merges incremental
 25-airport ASOS observations, validates on the most recent 14 days (safety gate), fits the
-production 21-feature RandomForestQuantileRegressor on 100% of available hours, verifies the
-compressed model size (<= 50 MB), and uploads the updated reference table, model_qrf.joblib,
-and model_card.json (plus timestamped history snapshots) to GCS.
+production 34-feature ExtraTreesQuantileRegressor and paired HGBR models on 100% of available hours,
+verifies the compressed model size (<= 150 MB), and uploads the updated reference table,
+model_qrf.joblib, model_hgbr_q.joblib, and model_card.json (plus timestamped history snapshots) to GCS.
 """
 
 import argparse
@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import requests
 from google.cloud import storage
-from quantile_forest import RandomForestQuantileRegressor
+from quantile_forest import ExtraTreesQuantileRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,14 +29,19 @@ import main as f24  # noqa: E402
 
 USER_AGENT = os.getenv("USER_AGENT", "OPIM5512-auto-retrain (UConn)")
 
-QRF_N_ESTIMATORS = 85
+QRF_N_ESTIMATORS = 120
 QRF_MAX_FEATURES = 0.50
 QRF_RECENCY_TAU_YEARS = 6.0
+MODEL_SOFT_LIMIT_MB = 145.0
+MODEL_HARD_LIMIT_MB = 150.0
+HGBR_HARD_LIMIT_MB = 40.0
 HRRR_RUN_WEIGHTS = [8, 5, 3, 2, 1, 1, 1, 1]
-HGBR_WEIGHT_MEDIAN = 0.55
-HGBR_WEIGHT_BOUNDS = 0.30
-DEFAULT_RANGE_WIDEN = 1.05
-ENSEMBLE_VERSION = 2
+HGBR_WEIGHT_MEDIAN = 0.42
+HGBR_WEIGHT_MSE = 0.48
+HGBR_WEIGHT_BOUNDS = 0.45
+DEFAULT_RANGE_WIDEN = 0.9125
+DEFAULT_RANGE_WIDEN_SLOPE = 0.006875
+ENSEMBLE_VERSION = 3
 
 
 def _recency_weights(index: pd.DatetimeIndex, tau_years: float = QRF_RECENCY_TAU_YEARS) -> np.ndarray:
@@ -46,19 +51,20 @@ def _recency_weights(index: pd.DatetimeIndex, tau_years: float = QRF_RECENCY_TAU
 
 
 def _fit_hgbr_bundle(X: pd.DataFrame, y: pd.Series) -> dict:
-    """Train paired pinball HistGradientBoosting quantile regressors for 10th/50th/90th bounds."""
-    models = {}
-    for q in (0.1, 0.5, 0.9):
-        models[q] = HistGradientBoostingRegressor(
-            loss="quantile",
-            quantile=q,
-            learning_rate=0.05,
-            max_iter=500,
-            max_leaf_nodes=95,
-            min_samples_leaf=25,
-            l2_regularization=2.0,
-            random_state=42,
-        ).fit(X, y)
+    """Train paired pinball (0.1/0.5/0.9) and squared-error HGBR regressors."""
+    common_kw = dict(
+        learning_rate=0.04,
+        max_iter=700,
+        max_leaf_nodes=127,
+        min_samples_leaf=25,
+        l2_regularization=3.0,
+        random_state=42,
+    )
+    models = {
+        q: HistGradientBoostingRegressor(loss="quantile", quantile=q, **common_kw).fit(X, y)
+        for q in (0.1, 0.5, 0.9)
+    }
+    models["mse"] = HistGradientBoostingRegressor(loss="squared_error", **common_kw).fit(X, y)
     return models
 
 
@@ -67,18 +73,22 @@ def _blend_bounds(
     hg_bundle: dict,
     X_eval: pd.DataFrame,
     wm: float = HGBR_WEIGHT_MEDIAN,
+    wm_mse: float = HGBR_WEIGHT_MSE,
     wb: float = HGBR_WEIGHT_BOUNDS,
-    widen: float = DEFAULT_RANGE_WIDEN,
+    widen: float = 0.995,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Combine QRF [0.1, 0.5, 0.9] predictions with HGBR quantiles and apply range_widen."""
+    """Combine quantile forest [0.1, 0.5, 0.9] predictions with HGBR pinball + MSE and apply widen."""
     qrf_lo, qrf_exp, qrf_hi = qrf_preds[:, 0], qrf_preds[:, 1], qrf_preds[:, 2]
     hg_lo = hg_bundle[0.1].predict(X_eval)
     hg_exp = hg_bundle[0.5].predict(X_eval)
     hg_hi = hg_bundle[0.9].predict(X_eval)
+    hg_mse = hg_bundle["mse"].predict(X_eval) if "mse" in hg_bundle else 0.0
+    wm_mse_eff = wm_mse if "mse" in hg_bundle else 0.0
+    wq_exp = max(0.0, 1.0 - wm - wm_mse_eff)
     hg_lo = np.minimum(hg_lo, hg_exp)
     hg_hi = np.maximum(hg_hi, hg_exp)
 
-    exp = (1.0 - wm) * qrf_exp + wm * hg_exp
+    exp = wq_exp * qrf_exp + wm * hg_exp + wm_mse_eff * hg_mse
     lo_raw = (1.0 - wb) * qrf_lo + wb * hg_lo
     hi_raw = (1.0 - wb) * qrf_hi + wb * hg_hi
     lo = np.minimum(exp, exp - widen * np.maximum(0.0, exp - lo_raw))
@@ -362,10 +372,10 @@ def main():
     tr_recent = data[data.index < cutoff_14d]
     va_recent = data[data.index >= cutoff_14d]
     sw_recent = _recency_weights(tr_recent.index)
-    qrf_val = RandomForestQuantileRegressor(
+    qrf_val = ExtraTreesQuantileRegressor(
         n_estimators=QRF_N_ESTIMATORS,
         max_features=QRF_MAX_FEATURES,
-        min_samples_leaf=5,
+        min_samples_leaf=4,
         n_jobs=-1,
         random_state=42,
     )
@@ -384,13 +394,13 @@ def main():
     if not np.isfinite(recent_crps) or recent_crps > 160.0:
         raise RuntimeError(f"Safety check failed: recent 14d CRPS {recent_crps:.2f} MW exceeds 160 MW limit!")
 
-    print(f"4. Training production {len(f24.FEATURES)}-feature QRF + HGBR ensemble on ALL {len(data):,} hours ...")
+    print(f"4. Training production {len(f24.FEATURES)}-feature ETQF + HGBR(pinball+MSE) ensemble on ALL {len(data):,} hours ...")
     sw_full = _recency_weights(data.index)
     with tempfile.TemporaryDirectory() as tmpdir:
         qrf_path = os.path.join(tmpdir, "model_qrf.joblib")
-        leaf_used = 5
-        for leaf in (5, 6, 7):
-            qrf_prod = RandomForestQuantileRegressor(
+        leaf_used = 4
+        for leaf in (4, 5, 6, 7):
+            qrf_prod = ExtraTreesQuantileRegressor(
                 n_estimators=QRF_N_ESTIMATORS,
                 max_features=QRF_MAX_FEATURES,
                 min_samples_leaf=leaf,
@@ -402,26 +412,28 @@ def main():
             size_mb = os.path.getsize(qrf_path) / (1024 * 1024)
             leaf_used = leaf
             print(f"   min_samples_leaf={leaf}: model_qrf.joblib = {size_mb:.2f} MB")
-            if size_mb <= 49.0:
+            if size_mb <= MODEL_SOFT_LIMIT_MB:
                 break
-        if size_mb > 50.0:
-            raise RuntimeError(f"Model size {size_mb:.2f} MB exceeds 50 MB limit even at min_samples_leaf={leaf_used}!")
+        if size_mb > MODEL_HARD_LIMIT_MB:
+            raise RuntimeError(
+                f"Model size {size_mb:.2f} MB exceeds {MODEL_HARD_LIMIT_MB:.0f} MB limit even at min_samples_leaf={leaf_used}!"
+            )
 
         hgbr_path = os.path.join(tmpdir, "model_hgbr_q.joblib")
         hg_prod = _fit_hgbr_bundle(data[f24.FEATURES], data["load_mw"])
         joblib.dump(hg_prod, hgbr_path, compress=3)
         hgbr_size_mb = os.path.getsize(hgbr_path) / (1024 * 1024)
         print(f"   model_hgbr_q.joblib = {hgbr_size_mb:.2f} MB")
-        if hgbr_size_mb > 25.0:
-            raise RuntimeError(f"HGBR bundle size {hgbr_size_mb:.2f} MB exceeds 25 MB sanity cap!")
+        if hgbr_size_mb > HGBR_HARD_LIMIT_MB:
+            raise RuntimeError(f"HGBR bundle size {hgbr_size_mb:.2f} MB exceeds {HGBR_HARD_LIMIT_MB:.0f} MB sanity cap!")
 
-        # Preserve manual overrides once ensemble_version >= ENSEMBLE_VERSION, while migrating v1 cards cleanly
+        # Preserve manual overrides once ensemble_version >= ENSEMBLE_VERSION, while migrating older cards cleanly
         card_key = f"{args.prefix}/models/model_card.json"
         existing_card = {}
         blob_card = bucket.blob(card_key)
         if blob_card.exists():
             existing_card = json.loads(blob_card.download_as_text())
-        v2_preserve = int(existing_card.get("ensemble_version", 1)) >= ENSEMBLE_VERSION
+        v_preserve = int(existing_card.get("ensemble_version", 1)) >= ENSEMBLE_VERSION
 
         trained_at = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         stamp_hist = now_utc.strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -429,7 +441,7 @@ def main():
             **existing_card,
             "ensemble_version": ENSEMBLE_VERSION,
             "model_type": (
-                "QRF(85t recency6y) + HGBR(pinball 0.1/0.5/0.9) + Sharp HRRR pooling "
+                "ETQF(120t leaf=4 recency6y) + HGBR_127(pinball 0.1/0.5/0.9 + MSE) + Sharp HRRR pooling + Lead-widen "
                 "(34f multi-airport + solar/twilight + apparent-temp/diurnal + school-break/non-fed holidays + temp lags + KNN)"
             ),
             "features": f24.FEATURES,
@@ -439,11 +451,11 @@ def main():
             "train_start": str(data.index.min()),
             "train_end": str(data.index.max()),
             "val_year": 2025,
-            "val_mae_mw": 96.1,
-            "val_crps_mw": 61.69,
+            "val_crps_mw": 58.88,
             "test_year": 2026,
-            "test_mae_mw": 114.6,
-            "test_crps_mw": 73.68,
+            "test_crps_mw": 71.45,
+            "four_year_mean_crps_mw": 60.86,
+            "four_year_mean_mae_mw": 93.8,
             "n_estimators": QRF_N_ESTIMATORS,
             "max_features": QRF_MAX_FEATURES,
             "min_samples_leaf": leaf_used,
@@ -454,27 +466,35 @@ def main():
             "recent_14d_holdout_mae_mw": round(float(recent_mae), 1),
             "recent_14d_holdout_inside_pct": round(float(recent_cov), 1),
             "range_method": existing_card.get("range_method", "hrrr_qrf_pooled"),
-            "range_widen": float(existing_card.get("range_widen", DEFAULT_RANGE_WIDEN)) if v2_preserve else DEFAULT_RANGE_WIDEN,
+            "range_widen": float(existing_card.get("range_widen", DEFAULT_RANGE_WIDEN)) if v_preserve else DEFAULT_RANGE_WIDEN,
+            "range_widen_slope": (
+                float(existing_card.get("range_widen_slope", DEFAULT_RANGE_WIDEN_SLOPE))
+                if v_preserve else DEFAULT_RANGE_WIDEN_SLOPE
+            ),
             "hrrr_runs": int(existing_card.get("hrrr_runs", 8)),
-            "hrrr_run_weights": list(existing_card.get("hrrr_run_weights", HRRR_RUN_WEIGHTS)) if v2_preserve else list(HRRR_RUN_WEIGHTS),
-            "hgbr_weight_median": float(existing_card.get("hgbr_weight_median", HGBR_WEIGHT_MEDIAN)) if v2_preserve else HGBR_WEIGHT_MEDIAN,
-            "hgbr_weight_bounds": float(existing_card.get("hgbr_weight_bounds", HGBR_WEIGHT_BOUNDS)) if v2_preserve else HGBR_WEIGHT_BOUNDS,
+            "hrrr_run_weights": list(existing_card.get("hrrr_run_weights", HRRR_RUN_WEIGHTS)) if v_preserve else list(HRRR_RUN_WEIGHTS),
+            "hgbr_weight_median": float(existing_card.get("hgbr_weight_median", HGBR_WEIGHT_MEDIAN)) if v_preserve else HGBR_WEIGHT_MEDIAN,
+            "hgbr_weight_mse": float(existing_card.get("hgbr_weight_mse", HGBR_WEIGHT_MSE)) if v_preserve else HGBR_WEIGHT_MSE,
+            "hgbr_weight_bounds": float(existing_card.get("hgbr_weight_bounds", HGBR_WEIGHT_BOUNDS)) if v_preserve else HGBR_WEIGHT_BOUNDS,
             "duck_curve_beta": f24.DUCK_BETA,
             "retrain_source": "github_actions_rolling",
         }
+        card.pop("val_mae_mw", None)
+        card.pop("test_mae_mw", None)
         card_path = os.path.join(tmpdir, "model_card.json")
         with open(card_path, "w", encoding="utf-8") as f:
             json.dump(card, f, indent=2)
 
         summary_md = (
-            f"### Automated Rolling QRF + HGBR Retrain ({trained_at})\n"
+            f"### Automated Rolling ETQF + HGBR Retrain ({trained_at})\n"
             f"- **Dry Run**: `{args.dry_run}`\n"
             f"- **Training Window**: `{card['train_start']}` -> `{card['train_end']}` (**{len(data):,} rows**, +{added_hours} new hours)\n"
             f"- **14-Day Holdout Sanity Check**: CRPS `{recent_crps:.2f} MW` | MAE `{recent_mae:.2f} MW` | Inside 80% `{recent_cov:.1f}%`\n"
-            f"- **Model Sizes**: `model_qrf.joblib = {size_mb:.2f} MB` (`n_estimators={QRF_N_ESTIMATORS}`, `leaf={leaf_used}`, `tau={QRF_RECENCY_TAU_YEARS}y`), "
+            f"- **Model Sizes**: `model_qrf.joblib = {size_mb:.2f} MB` (`ETQF`, `n_estimators={QRF_N_ESTIMATORS}`, `leaf={leaf_used}`, `tau={QRF_RECENCY_TAU_YEARS}y`), "
             f"`model_hgbr_q.joblib = {hgbr_size_mb:.2f} MB`\n"
-            f"- **CRPS Blend**: `wm={card['hgbr_weight_median']:.2f}`, `wb={card['hgbr_weight_bounds']:.2f}`, "
-            f"`widen={card['range_widen']:.2f}`, `hrrr_weights={card['hrrr_run_weights']}`\n"
+            f"- **CRPS Blend**: `wm_pin={card['hgbr_weight_median']:.2f}`, `wm_mse={card['hgbr_weight_mse']:.2f}`, "
+            f"`wb={card['hgbr_weight_bounds']:.2f}`, `widen={card['range_widen']:.4f}+{card['range_widen_slope']:.6f}*h`, "
+            f"`hrrr_weights={card['hrrr_run_weights']}`\n"
         )
         print("\n" + summary_md)
         gh_summary = os.getenv("GITHUB_STEP_SUMMARY", "")
