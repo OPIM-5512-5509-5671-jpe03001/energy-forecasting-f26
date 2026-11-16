@@ -48,6 +48,7 @@ LOW_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_low.joblib"
 HIGH_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_high.joblib"
 QRF_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_qrf.joblib"
 HGBR_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_hgbr_q.joblib"
+STAGE1_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_stage1.joblib"
 # Lab 6C: the class HRRR file, rewritten every hour at :05 by Dr. Dave's hrrr-bdl job (8 newest runs, 0-48 hours ahead)
 HRRR_RUNS_URL = os.getenv("HRRR_RUNS_URL", "https://storage.googleapis.com/opim5512-leaderboard-f26/weather/bdl_hrrr_runs.csv")
 HRRR_MAX_AGE_HOURS = 14        # newest run older than this = something is wrong upstream: use the NWS forecast instead
@@ -586,15 +587,60 @@ def _hrrr_table_weight(table, newest_init, weights_cfg):
     return max(1, int(weights_cfg[idx]))
 
 
+STAGE2_EXTRA_FEATURES = ["s1_pred_mw", "abs_temp_65", "s1_diff_yest", "s1_minus_knn"]
+STAGE2_FEATURES = FEATURES + STAGE2_EXTRA_FEATURES
+
+
+def build_stage2_features(X_base: pd.DataFrame, s1_pred, cols=None) -> pd.DataFrame:
+    """Append Stage-1 expected load and stress interactions for Stage-2 residual modeling."""
+    out = X_base[FEATURES].copy()
+    s1_vec = np.asarray(s1_pred, dtype=float)
+    s1_round = np.round(s1_vec, 1)
+    temp_vals = out["temp_f"].to_numpy(dtype=float)
+    yest_vals = out["load_yesterday_mw"].fillna(pd.Series(s1_round, index=out.index)).to_numpy(dtype=float)
+    knn_vals = out["knn_weather_load_mw"].fillna(pd.Series(s1_round, index=out.index)).to_numpy(dtype=float)
+    out["s1_pred_mw"] = s1_round
+    out["abs_temp_65"] = np.round(np.abs(temp_vals - 65.0), 1)
+    out["s1_diff_yest"] = np.round(s1_round - yest_vals, 1)
+    out["s1_minus_knn"] = np.round(s1_round - knn_vals, 1)
+    return out[list(cols)] if cols is not None else out[STAGE2_FEATURES]
+
+
+def _stage1_features(stage1_bundle, default_cols=FEATURES):
+    if isinstance(stage1_bundle, dict) and stage1_bundle.get("features"):
+        return list(stage1_bundle["features"])
+    return list(default_cols)
+
+
+def predict_stage1(stage1_bundle, X_df: pd.DataFrame) -> np.ndarray:
+    """Predict weighted Stage-1 point load (MW) from a list or bundle dict of (name, estimator, weight)."""
+    specs = stage1_bundle["models"] if isinstance(stage1_bundle, dict) else stage1_bundle
+    acc = np.zeros(len(X_df), dtype=float)
+    w_tot = 0.0
+    for _, estimator, weight in specs:
+        cols = list(getattr(estimator, "feature_names_in_", _stage1_features(stage1_bundle)))
+        acc += float(weight) * np.asarray(estimator.predict(X_df[cols]), dtype=float)
+        w_tot += float(weight)
+    return acc / w_tot if w_tot > 0.0 and abs(w_tot - 1.0) > 1e-6 else acc
+
+
 def pooled_range(bucket, card, targets, load, nws_weather, now):
-    """Lab 6C: the quantile forest's 20 percentiles (2.5%, 7.5%, ..., 97.5%) for every HRRR run that covers an hour, pooled
-    into one weighted pile per hour, blended with optional HGBR pinball + MSE point models when present;
-    low, expected and high are the calibrated 10th, 50th and 90th percentiles scaled by lead-aware range_widen.
+    """Pool 20 quantiles per weighted HRRR run across Stage-2 residual or Stage-1 load models,
+    blend with HGBR quantile/point models, and apply lead-aware calibration for 80% coverage.
     Returns (low, expected, high, info)."""
     if not bucket.blob(QRF_MODEL_KEY).exists():
         raise ValueError("Your model card says hrrr_qrf_pooled, but energy/models/model_qrf.joblib is missing.")
+    two_stage = bool(card.get("two_stage", int(card.get("ensemble_version", 1)) >= 4))
+    stage1_bundle = None
+    if two_stage:
+        if not bucket.blob(STAGE1_MODEL_KEY).exists():
+            raise ValueError("Your model card enables two_stage, but energy/models/model_stage1.joblib is missing.")
+        stage1_bundle = joblib.load(io.BytesIO(bucket.blob(STAGE1_MODEL_KEY).download_as_bytes()))
+        s1_cols = _stage1_features(stage1_bundle, FEATURES)
+
     qrf = joblib.load(io.BytesIO(bucket.blob(QRF_MODEL_KEY).download_as_bytes()))
-    qrf_cols = list(getattr(qrf, "feature_names_in_", FEATURES))
+    default_s2_cols = STAGE2_FEATURES if two_stage else FEATURES
+    qrf_cols = list(getattr(qrf, "feature_names_in_", default_s2_cols))
 
     wm = float(card.get("hgbr_weight_median", 0.0))
     wm_mse = float(card.get("hgbr_weight_mse", 0.0))
@@ -614,12 +660,26 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
     n_targets = len(targets)
     piles = [[] for _ in range(n_targets)]
     unique_runs = [0] * n_targets
+    s1_sum = np.zeros(n_targets, dtype=float)
+    s1_wsum = np.zeros(n_targets, dtype=float)
     hg_keys = [k for k in ((0.1, 0.5, 0.9) + (("mse",) if wm_mse > 0.0 else ())) if hgbr_bundle is not None and k in hgbr_bundle]
     hg_sum = {k: np.zeros(n_targets, dtype=float) for k in hg_keys}
     hg_wsum = np.zeros(n_targets, dtype=float)
 
     def _accumulate_table(positions, X_feat, weight):
-        q = qrf.predict(X_feat[qrf_cols], quantiles=POOL_QUANTILES)
+        if two_stage:
+            s1_pred = predict_stage1(stage1_bundle, X_feat[s1_cols])
+            for j, pos in enumerate(positions):
+                s1_sum[pos] += weight * float(s1_pred[j])
+                s1_wsum[pos] += weight
+            X_model = build_stage2_features(X_feat, s1_pred)
+            q_raw = qrf.predict(X_model[qrf_cols], quantiles=POOL_QUANTILES)
+            q = s1_pred[:, None] + q_raw
+        else:
+            s1_pred = None
+            X_model = X_feat
+            q = qrf.predict(X_model[qrf_cols], quantiles=POOL_QUANTILES)
+
         for j, pos in enumerate(positions):
             q_vals = q[j].tolist()
             for _ in range(weight):
@@ -627,9 +687,11 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
             unique_runs[pos] += 1
         if hgbr_bundle is not None and len(hg_keys) > 0:
             hg_cols = list(getattr(hgbr_bundle[hg_keys[0]], "feature_names_in_", qrf_cols))
-            X_hg = X_feat[hg_cols]
+            X_hg = X_model[hg_cols]
             for k in hg_keys:
-                preds = hgbr_bundle[k].predict(X_hg)
+                preds = np.asarray(hgbr_bundle[k].predict(X_hg), dtype=float)
+                if two_stage:
+                    preds = s1_pred + preds
                 for j, pos in enumerate(positions):
                     hg_sum[k][pos] += weight * float(preds[j])
             for pos in positions:
@@ -661,18 +723,20 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
 
     for i in range(n_targets):
         qrf_lo, qrf_exp, qrf_hi = np.quantile(piles[i], [0.1, 0.5, 0.9], method="hazen")
+        base_exp = (s1_sum[i] / s1_wsum[i]) if (two_stage and s1_wsum[i] > 0.0) else qrf_exp
         if hgbr_bundle is not None and hg_wsum[i] > 0.0:
             hg_lo = hg_sum[0.1][i] / hg_wsum[i]
             hg_exp = hg_sum[0.5][i] / hg_wsum[i]
             hg_hi = hg_sum[0.9][i] / hg_wsum[i]
-            hg_lo = min(hg_lo, hg_exp)
-            hg_hi = max(hg_hi, hg_exp)
+            if not two_stage:
+                hg_lo = min(hg_lo, hg_exp)
+                hg_hi = max(hg_hi, hg_exp)
             hg_mse = (hg_sum["mse"][i] / hg_wsum[i]) if has_mse else 0.0
-            exp_i = wq_exp * qrf_exp + wm * hg_exp + wm_mse_eff * hg_mse
+            exp_i = wq_exp * base_exp + wm * hg_exp + wm_mse_eff * hg_mse
             lo_raw = (1.0 - wb) * qrf_lo + wb * hg_lo
             hi_raw = (1.0 - wb) * qrf_hi + wb * hg_hi
         else:
-            exp_i, lo_raw, hi_raw = qrf_exp, qrf_lo, qrf_hi
+            exp_i, lo_raw, hi_raw = base_exp, qrf_lo, qrf_hi
         expected[i] = exp_i
         low[i] = lo_raw
         high[i] = hi_raw
@@ -689,6 +753,7 @@ def pooled_range(bucket, card, targets, load, nws_weather, now):
         "hrrr_runs_read": len(tables) if weather_source == "hrrr" else 0,
         "runs_per_hour_min": int(min(unique_runs)) if n_targets > 0 else 0,
         "runs_per_hour_max": int(max(unique_runs)) if n_targets > 0 else 0,
+        "two_stage": bool(two_stage),
         "hgbr_blended": bool(hgbr_bundle is not None),
         "hgbr_mse_blended": bool(has_mse),
     }

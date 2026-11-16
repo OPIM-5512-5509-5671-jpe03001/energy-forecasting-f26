@@ -1,10 +1,12 @@
-"""Automated rolling retraining pipeline for the Connecticut 24-hour ETQF + HGBR ensemble.
+"""Automated rolling retraining pipeline for the Connecticut Two-Stage CRPS ensemble.
 
 Reads historical reference data + live hourly scraper tables from GCS, merges incremental
-25-airport ASOS observations, validates on the most recent 14 days (safety gate), fits the
-production 34-feature ExtraTreesQuantileRegressor and paired HGBR models on 100% of available hours,
-verifies the compressed model size (<= 150 MB), and uploads the updated reference table,
-model_qrf.joblib, model_hgbr_q.joblib, and model_card.json (plus timestamped history snapshots) to GCS.
+25-airport ASOS observations, validates a leak-free Two-Stage ensemble on the most recent 14 days
+(safety gate), fits Stage 1 (weighted 5-HGBR MSE/L1 point ensemble), 5-fold purged OOF residuals,
+and Stage 2 ExtraTreesQuantileRegressor (280t leaf=5) + paired HGBR quantile regressors (0.1/0.5/0.9)
+on 100% of available hours, verifies compressed artifact sizes, and uploads the refreshed reference
+table, model_stage1.joblib, model_qrf.joblib, model_hgbr_q.joblib, and model_card.json (plus history
+snapshots) to GCS.
 """
 
 import argparse
@@ -21,6 +23,7 @@ import pandas as pd
 import requests
 from google.cloud import storage
 from quantile_forest import ExtraTreesQuantileRegressor
+from sklearn.base import clone
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,19 +32,22 @@ import main as f24  # noqa: E402
 
 USER_AGENT = os.getenv("USER_AGENT", "OPIM5512-auto-retrain (UConn)")
 
-QRF_N_ESTIMATORS = 120
+QRF_N_ESTIMATORS = 280
+QRF_MIN_SAMPLES_LEAF = 5
 QRF_MAX_FEATURES = 0.50
 QRF_RECENCY_TAU_YEARS = 6.0
-MODEL_SOFT_LIMIT_MB = 145.0
-MODEL_HARD_LIMIT_MB = 150.0
+MODEL_SOFT_LIMIT_MB = 290.0
+MODEL_HARD_LIMIT_MB = 320.0
+STAGE1_HARD_LIMIT_MB = 60.0
 HGBR_HARD_LIMIT_MB = 40.0
+STAGE1_OOF_FOLDS = 5
 HRRR_RUN_WEIGHTS = [8, 5, 3, 2, 1, 1, 1, 1]
-HGBR_WEIGHT_MEDIAN = 0.42
-HGBR_WEIGHT_MSE = 0.48
-HGBR_WEIGHT_BOUNDS = 0.45
-DEFAULT_RANGE_WIDEN = 0.9125
-DEFAULT_RANGE_WIDEN_SLOPE = 0.006875
-ENSEMBLE_VERSION = 3
+HGBR_WEIGHT_MEDIAN = 0.55
+HGBR_WEIGHT_MSE = 0.0
+HGBR_WEIGHT_BOUNDS = 0.40
+DEFAULT_RANGE_WIDEN = 1.02
+DEFAULT_RANGE_WIDEN_SLOPE = 0.0085
+ENSEMBLE_VERSION = 4
 
 
 def _recency_weights(index: pd.DatetimeIndex, tau_years: float = QRF_RECENCY_TAU_YEARS) -> np.ndarray:
@@ -50,47 +56,95 @@ def _recency_weights(index: pd.DatetimeIndex, tau_years: float = QRF_RECENCY_TAU
     return np.exp(-np.asarray(age_years, dtype=float) / tau_years)
 
 
-def _fit_hgbr_bundle(X: pd.DataFrame, y: pd.Series) -> dict:
-    """Train paired pinball (0.1/0.5/0.9) and squared-error HGBR regressors."""
+def _stage1_specs():
+    """Return Stage-1 5-HGBR point ensemble specs: (name, estimator, recency_tau_years, weight)."""
+    return [
+        ("mse_127", HistGradientBoostingRegressor(
+            loss="squared_error", learning_rate=0.04, max_iter=800, max_leaf_nodes=127,
+            min_samples_leaf=25, l2_regularization=3.0, max_features=0.75, random_state=42,
+        ), None, 0.20),
+        ("l1_127", HistGradientBoostingRegressor(
+            loss="absolute_error", learning_rate=0.04, max_iter=800, max_leaf_nodes=127,
+            min_samples_leaf=25, l2_regularization=3.0, max_features=0.75, random_state=42,
+        ), None, 0.15),
+        ("mse_127_r8", HistGradientBoostingRegressor(
+            loss="squared_error", learning_rate=0.04, max_iter=800, max_leaf_nodes=127,
+            min_samples_leaf=25, l2_regularization=3.0, max_features=0.75, random_state=43,
+        ), 8.0, 0.25),
+        ("l1_127_r8", HistGradientBoostingRegressor(
+            loss="absolute_error", learning_rate=0.04, max_iter=800, max_leaf_nodes=127,
+            min_samples_leaf=25, l2_regularization=3.0, max_features=0.75, random_state=43,
+        ), 8.0, 0.15),
+        ("mse_191_r8", HistGradientBoostingRegressor(
+            loss="squared_error", learning_rate=0.03, max_iter=900, max_leaf_nodes=191,
+            min_samples_leaf=30, l2_regularization=6.0, max_features=0.70, random_state=44,
+        ), 8.0, 0.25),
+    ]
+
+
+def _fit_stage1(X: pd.DataFrame, y: pd.Series) -> dict:
+    """Fit the 5-model Stage-1 point ensemble."""
+    fitted = []
+    for name, est, tau, weight in _stage1_specs():
+        model = clone(est)
+        if tau is None:
+            model.fit(X, y)
+        else:
+            model.fit(X, y, sample_weight=_recency_weights(X.index, tau))
+        fitted.append((name, model, weight))
+    return {"models": fitted, "features": list(X.columns)}
+
+
+def _compute_oof_stage1(X: pd.DataFrame, y: pd.Series, n_folds: int = STAGE1_OOF_FOLDS) -> pd.Series:
+    """Compute strictly out-of-fold Stage-1 predictions across chronological folds with a +/-48h purge."""
+    bounds = np.linspace(0, len(X), n_folds + 1, dtype=int)
+    oof = pd.Series(np.nan, index=X.index, dtype=float)
+    for k in range(n_folds):
+        val_idx = X.index[bounds[k]:bounds[k + 1]]
+        t_lo = val_idx.min() - pd.Timedelta(hours=48)
+        t_hi = val_idx.max() + pd.Timedelta(hours=48)
+        tr_idx = X.index[(X.index < t_lo) | (X.index > t_hi)]
+        s1_fold = _fit_stage1(X.loc[tr_idx], y.loc[tr_idx])
+        oof.loc[val_idx] = f24.predict_stage1(s1_fold, X.loc[val_idx])
+    return oof
+
+
+def _fit_hgbr_bundle(X_s2: pd.DataFrame, resid: pd.Series) -> dict:
+    """Train paired Stage-2 quantile HGBR residual regressors (0.1/0.5/0.9)."""
     common_kw = dict(
         learning_rate=0.04,
         max_iter=700,
         max_leaf_nodes=127,
-        min_samples_leaf=25,
-        l2_regularization=3.0,
+        min_samples_leaf=30,
+        l2_regularization=4.0,
+        max_features=0.75,
         random_state=42,
     )
-    models = {
-        q: HistGradientBoostingRegressor(loss="quantile", quantile=q, **common_kw).fit(X, y)
+    return {
+        q: HistGradientBoostingRegressor(loss="quantile", quantile=q, **common_kw).fit(X_s2, resid)
         for q in (0.1, 0.5, 0.9)
     }
-    models["mse"] = HistGradientBoostingRegressor(loss="squared_error", **common_kw).fit(X, y)
-    return models
 
 
-def _blend_bounds(
-    qrf_preds: np.ndarray,
+def _blend_twostage_bounds(
+    s1_pred: np.ndarray,
+    et_resid_preds: np.ndarray,
     hg_bundle: dict,
-    X_eval: pd.DataFrame,
-    wm: float = HGBR_WEIGHT_MEDIAN,
-    wm_mse: float = HGBR_WEIGHT_MSE,
+    X_s2_eval: pd.DataFrame,
+    hm: float = HGBR_WEIGHT_MEDIAN,
     wb: float = HGBR_WEIGHT_BOUNDS,
-    widen: float = 0.995,
+    widen: float = DEFAULT_RANGE_WIDEN + 12.0 * DEFAULT_RANGE_WIDEN_SLOPE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Combine quantile forest [0.1, 0.5, 0.9] predictions with HGBR pinball + MSE and apply widen."""
-    qrf_lo, qrf_exp, qrf_hi = qrf_preds[:, 0], qrf_preds[:, 1], qrf_preds[:, 2]
-    hg_lo = hg_bundle[0.1].predict(X_eval)
-    hg_exp = hg_bundle[0.5].predict(X_eval)
-    hg_hi = hg_bundle[0.9].predict(X_eval)
-    hg_mse = hg_bundle["mse"].predict(X_eval) if "mse" in hg_bundle else 0.0
-    wm_mse_eff = wm_mse if "mse" in hg_bundle else 0.0
-    wq_exp = max(0.0, 1.0 - wm - wm_mse_eff)
-    hg_lo = np.minimum(hg_lo, hg_exp)
-    hg_hi = np.maximum(hg_hi, hg_exp)
+    """Recombine Stage-1 expected load with Stage-2 residual quantile predictions and apply widen."""
+    et_lo = s1_pred + et_resid_preds[:, 0]
+    et_hi = s1_pred + et_resid_preds[:, 2]
+    hg_lo = s1_pred + np.asarray(hg_bundle[0.1].predict(X_s2_eval), dtype=float)
+    hg_exp = s1_pred + np.asarray(hg_bundle[0.5].predict(X_s2_eval), dtype=float)
+    hg_hi = s1_pred + np.asarray(hg_bundle[0.9].predict(X_s2_eval), dtype=float)
 
-    exp = wq_exp * qrf_exp + wm * hg_exp + wm_mse_eff * hg_mse
-    lo_raw = (1.0 - wb) * qrf_lo + wb * hg_lo
-    hi_raw = (1.0 - wb) * qrf_hi + wb * hg_hi
+    exp = (1.0 - hm) * s1_pred + hm * hg_exp
+    lo_raw = (1.0 - wb) * et_lo + wb * hg_lo
+    hi_raw = (1.0 - wb) * et_hi + wb * hg_hi
     lo = np.minimum(exp, exp - widen * np.maximum(0.0, exp - lo_raw))
     hi = np.maximum(exp, exp + widen * np.maximum(0.0, hi_raw - exp))
     return lo, exp, hi
@@ -367,22 +421,28 @@ def main():
     if len(data) < 75000:
         raise RuntimeError(f"Safety check failed: only {len(data)} training rows (< 75,000).")
 
-    print("3. Running 14-day rolling holdout sanity check ...")
+    print("3. Running 14-day rolling holdout sanity check (Two-Stage OOF) ...")
     cutoff_14d = new_end - pd.Timedelta(days=14)
     tr_recent = data[data.index < cutoff_14d]
     va_recent = data[data.index >= cutoff_14d]
     sw_recent = _recency_weights(tr_recent.index)
+    s1_oof_val = _compute_oof_stage1(tr_recent[f24.FEATURES], tr_recent["load_mw"], n_folds=3)
+    r_oof_val = tr_recent["load_mw"] - s1_oof_val
+    X_s2_val_tr = f24.build_stage2_features(tr_recent, s1_oof_val.to_numpy(dtype=float))
+    s1_val = _fit_stage1(tr_recent[f24.FEATURES], tr_recent["load_mw"])
     qrf_val = ExtraTreesQuantileRegressor(
         n_estimators=QRF_N_ESTIMATORS,
         max_features=QRF_MAX_FEATURES,
-        min_samples_leaf=4,
+        min_samples_leaf=QRF_MIN_SAMPLES_LEAF,
         n_jobs=-1,
         random_state=42,
     )
-    qrf_val.fit(tr_recent[f24.FEATURES], tr_recent["load_mw"], sample_weight=sw_recent)
-    hg_val = _fit_hgbr_bundle(tr_recent[f24.FEATURES], tr_recent["load_mw"])
-    preds_qrf = qrf_val.predict(va_recent[f24.FEATURES], quantiles=[0.1, 0.5, 0.9])
-    lo_va, exp_va, hi_va = _blend_bounds(preds_qrf, hg_val, va_recent[f24.FEATURES])
+    qrf_val.fit(X_s2_val_tr, r_oof_val, sample_weight=sw_recent)
+    hg_val = _fit_hgbr_bundle(X_s2_val_tr, r_oof_val)
+    s1_pred_va = f24.predict_stage1(s1_val, va_recent[f24.FEATURES])
+    X_s2_va = f24.build_stage2_features(va_recent, s1_pred_va)
+    preds_et_res = qrf_val.predict(X_s2_va, quantiles=[0.1, 0.5, 0.9])
+    lo_va, exp_va, hi_va = _blend_twostage_bounds(s1_pred_va, preds_et_res, hg_val, X_s2_va)
     y_va = va_recent["load_mw"].values
     recent_crps = crps_3_score(y_va, lo_va, exp_va, hi_va)
     recent_mae = float(np.mean(np.abs(y_va - exp_va)))
@@ -394,12 +454,27 @@ def main():
     if not np.isfinite(recent_crps) or recent_crps > 160.0:
         raise RuntimeError(f"Safety check failed: recent 14d CRPS {recent_crps:.2f} MW exceeds 160 MW limit!")
 
-    print(f"4. Training production {len(f24.FEATURES)}-feature ETQF + HGBR(pinball+MSE) ensemble on ALL {len(data):,} hours ...")
+    print(
+        f"4. Training production Two-Stage ensemble (Stage1 5-HGBR {STAGE1_OOF_FOLDS}-fold purged OOF -> "
+        f"Stage2 {len(f24.STAGE2_FEATURES)}-feature ETQF + HGBR) on ALL {len(data):,} hours ..."
+    )
     sw_full = _recency_weights(data.index)
+    s1_oof_full = _compute_oof_stage1(data[f24.FEATURES], data["load_mw"], n_folds=STAGE1_OOF_FOLDS)
+    r_oof_full = data["load_mw"] - s1_oof_full
+    X_s2_full = f24.build_stage2_features(data, s1_oof_full.to_numpy(dtype=float))
+
     with tempfile.TemporaryDirectory() as tmpdir:
+        s1_path = os.path.join(tmpdir, "model_stage1.joblib")
+        s1_prod = _fit_stage1(data[f24.FEATURES], data["load_mw"])
+        joblib.dump(s1_prod, s1_path, compress=3)
+        s1_size_mb = os.path.getsize(s1_path) / (1024 * 1024)
+        print(f"   model_stage1.joblib = {s1_size_mb:.2f} MB")
+        if s1_size_mb > STAGE1_HARD_LIMIT_MB:
+            raise RuntimeError(f"Stage-1 bundle size {s1_size_mb:.2f} MB exceeds {STAGE1_HARD_LIMIT_MB:.0f} MB sanity cap!")
+
         qrf_path = os.path.join(tmpdir, "model_qrf.joblib")
-        leaf_used = 4
-        for leaf in (4, 5, 6, 7):
+        leaf_used = QRF_MIN_SAMPLES_LEAF
+        for leaf in (5, 6, 7, 8):
             qrf_prod = ExtraTreesQuantileRegressor(
                 n_estimators=QRF_N_ESTIMATORS,
                 max_features=QRF_MAX_FEATURES,
@@ -407,7 +482,7 @@ def main():
                 n_jobs=-1,
                 random_state=42,
             )
-            qrf_prod.fit(data[f24.FEATURES], data["load_mw"], sample_weight=sw_full)
+            qrf_prod.fit(X_s2_full, r_oof_full, sample_weight=sw_full)
             joblib.dump(qrf_prod, qrf_path, compress=3)
             size_mb = os.path.getsize(qrf_path) / (1024 * 1024)
             leaf_used = leaf
@@ -420,7 +495,7 @@ def main():
             )
 
         hgbr_path = os.path.join(tmpdir, "model_hgbr_q.joblib")
-        hg_prod = _fit_hgbr_bundle(data[f24.FEATURES], data["load_mw"])
+        hg_prod = _fit_hgbr_bundle(X_s2_full, r_oof_full)
         joblib.dump(hg_prod, hgbr_path, compress=3)
         hgbr_size_mb = os.path.getsize(hgbr_path) / (1024 * 1024)
         print(f"   model_hgbr_q.joblib = {hgbr_size_mb:.2f} MB")
@@ -440,26 +515,33 @@ def main():
         card = {
             **existing_card,
             "ensemble_version": ENSEMBLE_VERSION,
+            "two_stage": True,
             "model_type": (
-                "ETQF(120t leaf=4 recency6y) + HGBR_127(pinball 0.1/0.5/0.9 + MSE) + Sharp HRRR pooling + Lead-widen "
-                "(34f multi-airport + solar/twilight + apparent-temp/diurnal + school-break/non-fed holidays + temp lags + KNN)"
+                "Two-Stage CRPS: Stage1 5-HGBR(MSE+L1) -> Stage2 ETQF(280t leaf=5 recency6y resid) "
+                "+ HGBR_127(pinball 0.1/0.5/0.9 resid) + Sharp HRRR pooling + Lead-widen"
             ),
             "features": f24.FEATURES,
+            "stage2_features": f24.STAGE2_FEATURES,
             "target": "load_mw",
             "trained_at": trained_at,
             "train_rows": int(len(data)),
             "train_start": str(data.index.min()),
             "train_end": str(data.index.max()),
             "val_year": 2025,
-            "val_crps_mw": 58.88,
+            "val_crps_mw": 55.78,
             "test_year": 2026,
-            "test_crps_mw": 71.45,
-            "four_year_mean_crps_mw": 60.86,
-            "four_year_mean_mae_mw": 93.8,
+            "test_crps_mw": 68.08,
+            "three_year_mean_crps_mw": 59.52,
+            "three_year_skill_pct": 75.17,
+            "three_year_mean_mae_mw": 94.1,
+            "three_year_mean_rmse_mw": 134.1,
+            "three_year_inside_80_pct": 80.1,
             "n_estimators": QRF_N_ESTIMATORS,
             "max_features": QRF_MAX_FEATURES,
             "min_samples_leaf": leaf_used,
             "recency_tau_years": QRF_RECENCY_TAU_YEARS,
+            "stage1_oof_folds": STAGE1_OOF_FOLDS,
+            "stage1_model_size_mb": round(float(s1_size_mb), 2),
             "model_size_mb": round(float(size_mb), 2),
             "hgbr_model_size_mb": round(float(hgbr_size_mb), 2),
             "recent_14d_holdout_crps_mw": round(float(recent_crps), 2),
@@ -479,20 +561,21 @@ def main():
             "duck_curve_beta": f24.DUCK_BETA,
             "retrain_source": "github_actions_rolling",
         }
-        card.pop("val_mae_mw", None)
-        card.pop("test_mae_mw", None)
+        for stale_key in ("val_mae_mw", "test_mae_mw", "four_year_mean_crps_mw", "four_year_mean_mae_mw"):
+            card.pop(stale_key, None)
         card_path = os.path.join(tmpdir, "model_card.json")
         with open(card_path, "w", encoding="utf-8") as f:
             json.dump(card, f, indent=2)
 
         summary_md = (
-            f"### Automated Rolling ETQF + HGBR Retrain ({trained_at})\n"
+            f"### Automated Rolling Two-Stage CRPS Retrain ({trained_at})\n"
             f"- **Dry Run**: `{args.dry_run}`\n"
             f"- **Training Window**: `{card['train_start']}` -> `{card['train_end']}` (**{len(data):,} rows**, +{added_hours} new hours)\n"
             f"- **14-Day Holdout Sanity Check**: CRPS `{recent_crps:.2f} MW` | MAE `{recent_mae:.2f} MW` | Inside 80% `{recent_cov:.1f}%`\n"
-            f"- **Model Sizes**: `model_qrf.joblib = {size_mb:.2f} MB` (`ETQF`, `n_estimators={QRF_N_ESTIMATORS}`, `leaf={leaf_used}`, `tau={QRF_RECENCY_TAU_YEARS}y`), "
+            f"- **Model Sizes**: `model_stage1.joblib = {s1_size_mb:.2f} MB`, "
+            f"`model_qrf.joblib = {size_mb:.2f} MB` (`Stage2 ETQF resid`, `n_estimators={QRF_N_ESTIMATORS}`, `leaf={leaf_used}`, `tau={QRF_RECENCY_TAU_YEARS}y`), "
             f"`model_hgbr_q.joblib = {hgbr_size_mb:.2f} MB`\n"
-            f"- **CRPS Blend**: `wm_pin={card['hgbr_weight_median']:.2f}`, `wm_mse={card['hgbr_weight_mse']:.2f}`, "
+            f"- **CRPS Blend**: `hm={card['hgbr_weight_median']:.2f}`, `wm_mse={card['hgbr_weight_mse']:.2f}`, "
             f"`wb={card['hgbr_weight_bounds']:.2f}`, `widen={card['range_widen']:.4f}+{card['range_widen_slope']:.6f}*h`, "
             f"`hrrr_weights={card['hrrr_run_weights']}`\n"
         )
@@ -506,11 +589,16 @@ def main():
             print("5. Dry run enabled: skipping GCS uploads.")
             return
 
-        print("5. Uploading refreshed reference dataset, model_qrf.joblib, model_hgbr_q.joblib, model_card.json, and history snapshots to GCS ...")
+        print("5. Uploading refreshed reference dataset, model_stage1.joblib, model_qrf.joblib, model_hgbr_q.joblib, model_card.json, and history snapshots to GCS ...")
         ref_out = ref_df[REF_COLS].reset_index()
         ref_blob = bucket.blob(f"{args.prefix}/datasets/bdl_weather_load_ref_2017_2026.csv")
         ref_blob.chunk_size = 5 * 1024 * 1024
         ref_blob.upload_from_string(ref_out.to_csv(index=False), content_type="text/csv", timeout=300)
+
+        b_s1 = bucket.blob(f"{args.prefix}/models/model_stage1.joblib")
+        b_s1.chunk_size = 5 * 1024 * 1024
+        b_s1.upload_from_filename(s1_path, timeout=300)
+        bucket.copy_blob(b_s1, bucket, f"{args.prefix}/models/history/model_stage1_{stamp_hist}.joblib")
 
         b_qrf = bucket.blob(f"{args.prefix}/models/model_qrf.joblib")
         b_qrf.chunk_size = 5 * 1024 * 1024
