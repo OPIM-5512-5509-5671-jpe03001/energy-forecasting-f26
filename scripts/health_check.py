@@ -245,6 +245,7 @@ def main():
 
     # 9. Model artifact, model card, feature alignment, and daily retrain freshness
     qrf_blob = bucket.blob(f"{args.prefix}/models/model_qrf.joblib")
+    s1_blob = bucket.blob(f"{args.prefix}/models/model_stage1.joblib")
     hgbr_blob = bucket.blob(f"{args.prefix}/models/model_hgbr_q.joblib")
     card_blob = bucket.blob(f"{args.prefix}/models/model_card.json")
     if not qrf_blob.exists() or not card_blob.exists():
@@ -257,6 +258,16 @@ def main():
         age_h = (now_ts - trained_at).total_seconds() / 3600.0 if pd.notna(trained_at) else 999.0
         card_feats = list(card.get("features", []))
         feats_match = card_feats == list(f24.FEATURES)
+        two_stage = bool(card.get("two_stage", int(card.get("ensemble_version", 1)) >= 4))
+        s1_ok = (not two_stage) or s1_blob.exists()
+        s1_info = ""
+        s1_mb = 0.0
+        if two_stage and s1_blob.exists():
+            s1_blob.reload()
+            s1_mb = (s1_blob.size or 0) / (1024 * 1024)
+            s1_info = f"stage1={s1_mb:.2f} MB (<=60), "
+        elif two_stage:
+            s1_info = "stage1=MISSING, "
         wm = float(card.get("hgbr_weight_median", 0.0))
         wm_mse = float(card.get("hgbr_weight_mse", 0.0))
         wb = float(card.get("hgbr_weight_bounds", 0.0))
@@ -272,11 +283,11 @@ def main():
         elif needs_hgbr:
             hgbr_info = ", hgbr=MISSING"
         detail = (
-            f"qrf={size_mb:.2f} MB (<=150){hgbr_info}, trained {age_h:.1f}h ago, "
+            f"{s1_info}qrf={size_mb:.2f} MB (<=320){hgbr_info}, two_stage={two_stage}, trained {age_h:.1f}h ago, "
             f"rows={card.get('train_rows')}, features_match={feats_match} ({len(card_feats)}/{len(f24.FEATURES)}), "
             f"14d_crps={card.get('recent_14d_holdout_crps_mw', 'n/a')} MW"
         )
-        if size_mb > 150.0 or not feats_match or not hgbr_ok:
+        if size_mb > 320.0 or s1_mb > 60.0 or not feats_match or not hgbr_ok or not s1_ok:
             report.add("Model Artifact & Card", "FAIL", detail)
         elif age_h > 36.0:
             report.add("Model Artifact & Card", "WARN", detail + " (retrain >36h old)")
