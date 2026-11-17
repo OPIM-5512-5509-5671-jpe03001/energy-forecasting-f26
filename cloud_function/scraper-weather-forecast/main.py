@@ -20,6 +20,8 @@ import io
 import json
 import logging
 import os
+import random
+import time
 import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -152,12 +154,32 @@ def fetch_open_meteo_multi_model(scraped_hour: pd.Timestamp) -> pd.DataFrame:
         "&models=best_match,gfs_seamless,ecmwf_ifs025"
         "&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=UTC&forecast_days=3"
     )
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=45)
-        r.raise_for_status()
-        payload = r.json()
-    except Exception as err:
-        logging.warning("Open-Meteo multi-model fetch failed: %s", err)
+    payload = None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=(10, 45))
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                delay = 3.0 * attempt + random.uniform(0.5, 3.0)
+                logging.warning("Open-Meteo HTTP %s on attempt %d/%d; retrying in %.1fs", r.status_code, attempt, max_attempts, delay)
+                time.sleep(delay)
+                continue
+            r.raise_for_status()
+            payload = r.json()
+            break
+        except requests.exceptions.RequestException as err:
+            if attempt < max_attempts:
+                delay = 3.0 * attempt + random.uniform(0.5, 3.0)
+                logging.warning("Open-Meteo fetch attempt %d/%d failed (%s); retrying in %.1fs", attempt, max_attempts, err, delay)
+                time.sleep(delay)
+            else:
+                logging.warning("Open-Meteo multi-model fetch failed after %d attempts: %s", max_attempts, err)
+                return pd.DataFrame()
+        except Exception as err:
+            logging.warning("Open-Meteo multi-model parse failed: %s", err)
+            return pd.DataFrame()
+
+    if payload is None:
         return pd.DataFrame()
 
     frames = []
@@ -220,12 +242,19 @@ def build_regional_summary(multi_df: pd.DataFrame, scraped_hour: pd.Timestamp) -
     west_ny_stations = ["ALB", "POU", "HPN", "DXR", "LGA", "JFK"]
     east_ma_ri_stations = ["PVD", "ORH", "BOS", "WST"]
 
-    # Average across available models per (target_hour_utc, station) first for spatial aggregations
-    st_avg = multi_df.groupby(["target_hour_utc", "station"], as_index=False)[
-        ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct", "solar_wm2"]
-    ].mean()
+    # Average across available models per (target_hour_utc, station) first for spatial aggregations;
+    # NWS-only fallback lacks solar_wm2 (or partial fields), so ensure numeric schema columns exist safely.
+    agg_cols = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct", "solar_wm2"]
+    work = multi_df.copy()
+    for col in agg_cols:
+        if col not in work.columns:
+            work[col] = np.nan
+        else:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    hours = sorted(multi_df["target_hour_utc"].unique())
+    st_avg = work.groupby(["target_hour_utc", "station"], as_index=False)[agg_cols].mean()
+
+    hours = sorted(work["target_hour_utc"].unique())
     out = pd.DataFrame({"target_hour_utc": hours})
     out["scraped_hour_utc"] = scraped_hour
     out["lead_hours"] = ((out["target_hour_utc"] - scraped_hour) / pd.Timedelta(hours=1)).astype(int)
@@ -240,7 +269,7 @@ def build_regional_summary(multi_df: pd.DataFrame, scraped_hour: pd.Timestamp) -
         g = sub.groupby("target_hour_utc")
         return (g["wx"].sum() / g["w"].sum()).round(2)
 
-    for col in ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct", "solar_wm2"]:
+    for col in agg_cols:
         out[f"ct_pop_{col}"] = out["target_hour_utc"].map(_weighted_series(st_avg, ct_weights, col))
         out[f"isone_8city_{col}"] = out["target_hour_utc"].map(_weighted_series(st_avg, isone_weights, col))
 
@@ -257,7 +286,7 @@ def build_regional_summary(multi_df: pd.DataFrame, scraped_hour: pd.Timestamp) -
     out["west_east_temp_diff_f"] = (out["west_ny_temp_f"] - out["east_ma_ri_temp_f"]).round(2)
 
     # Multi-model consensus & spread across NWS, HRRR, GFS, ECMWF at BDL + BDR (CT's two ISO-NE stations)
-    ct_main = multi_df[multi_df["station"].isin(["BDL", "BDR"])].groupby(["target_hour_utc", "model"], as_index=False)["temp_f"].mean()
+    ct_main = work[work["station"].isin(["BDL", "BDR"])].groupby(["target_hour_utc", "model"], as_index=False)["temp_f"].mean()
     for mod in ["nws", "hrrr_blend", "gfs", "ecmwf"]:
         s_mod = ct_main[ct_main["model"] == mod].set_index("target_hour_utc")["temp_f"].round(2)
         out[f"ct_{mod}_temp_f"] = out["target_hour_utc"].map(s_mod)
@@ -315,7 +344,8 @@ def run_once(dry_run: bool = False) -> dict:
     # Enrich keep_bdl with solar_wm2 and regional multi-airport gradients so bdl_weather_forecast_master.csv has them ready
     if len(regional_df) > 0:
         reg_idx = regional_df.set_index("target_hour_utc")
-        keep_bdl["solar_wm2"] = keep_bdl["target_hour_utc"].map(reg_idx["bdl_solar_wm2"]).fillna(0.0)
+        bdl_sol_s = reg_idx["bdl_solar_wm2"] if "bdl_solar_wm2" in reg_idx.columns else pd.Series(dtype=float)
+        keep_bdl["solar_wm2"] = pd.to_numeric(keep_bdl["target_hour_utc"].map(bdl_sol_s), errors="coerce").fillna(0.0)
         for rcol in ["ct_coast_inland_temp_diff_f", "west_east_temp_diff_f", "ct_pop_temp_f", "isone_8city_temp_f",
                      "ct_hrrr_blend_temp_f", "ct_gfs_temp_f", "ct_ecmwf_temp_f", "ct_model_temp_spread_f"]:
             if rcol in reg_idx.columns:
@@ -350,21 +380,24 @@ def run_once(dry_run: bool = False) -> dict:
         ["scraped_hour_utc", "target_hour_utc"]
     )
     # Keep last 7 days of raw multi-airport rows in multi_airport_weather_forecast_master.csv so file stays compact
-    blob_m = bucket.blob(MULTI_AIRPORT_KEY)
-    if blob_m.exists():
-        old_m = pd.read_csv(io.BytesIO(blob_m.download_as_bytes()))
-        for c in ["scraped_hour_utc", "issued_at_utc", "target_hour_utc"]:
-            if c in old_m.columns:
-                old_m[c] = pd.to_datetime(old_m[c], utc=True)
-        cutoff = scraped_hour - pd.Timedelta(days=7)
-        old_m = old_m[old_m["scraped_hour_utc"] >= cutoff]
-        both_m = pd.concat([old_m, multi_df], ignore_index=True)
-        master_m = both_m.drop_duplicates(["scraped_hour_utc", "target_hour_utc", "station", "model"], keep="last")
+    if len(multi_df) > 0:
+        blob_m = bucket.blob(MULTI_AIRPORT_KEY)
+        if blob_m.exists():
+            old_m = pd.read_csv(io.BytesIO(blob_m.download_as_bytes()))
+            for c in ["scraped_hour_utc", "issued_at_utc", "target_hour_utc"]:
+                if c in old_m.columns:
+                    old_m[c] = pd.to_datetime(old_m[c], utc=True)
+            cutoff = scraped_hour - pd.Timedelta(days=7)
+            old_m = old_m[old_m["scraped_hour_utc"] >= cutoff]
+            both_m = pd.concat([old_m, multi_df], ignore_index=True)
+            master_m = both_m.drop_duplicates(["scraped_hour_utc", "target_hour_utc", "station", "model"], keep="last")
+        else:
+            master_m = multi_df
+        master_m = master_m.sort_values(["scraped_hour_utc", "target_hour_utc", "station", "model"])
+        blob_m.upload_from_string(master_m.to_csv(index=False), content_type="text/csv")
+        summary["multi_airport_master_rows"] = int(len(master_m))
     else:
-        master_m = multi_df
-    master_m = master_m.sort_values(["scraped_hour_utc", "target_hour_utc", "station", "model"])
-    blob_m.upload_from_string(master_m.to_csv(index=False), content_type="text/csv")
-    summary["multi_airport_master_rows"] = int(len(master_m))
+        summary["multi_airport_master_rows"] = 0
     return summary
 
 
