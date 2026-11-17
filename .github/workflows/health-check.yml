@@ -50,7 +50,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r cloud_function/forecast-24h/requirements.txt requests
 
-      - name: Verify Python syntax and 34-feature engineering offline
+      - name: Verify Python syntax and feature engineering offline
         run: |
           python -m py_compile cloud_function/*/*.py scripts/*.py
           python - <<'PY'
@@ -75,9 +75,8 @@ jobs:
           load = pd.Series(3200.0, index=idx)
           X = f24.make_features(idx[-48:], w, load)
           assert list(X.columns) == f24.FEATURES, "Feature schema mismatch"
-          assert len(f24.FEATURES) >= 34, f"Expected >=34 features, got {len(f24.FEATURES)}"
-          non_lag = [c for c in f24.FEATURES if c not in f24.LOAD_LAGS + ["knn_weather_load_mw"]]
-          assert X[non_lag].isna().sum().sum() == 0, "Unexpected NaNs in computed features"
+          assert len(f24.FEATURES) >= 11, f"Expected >=11 features, got {len(f24.FEATURES)}"
+          assert X.isna().sum().sum() == 0, "Unexpected NaNs in computed features"
           print(f"Offline check passed ({len(f24.FEATURES)} features).")
           PY
 

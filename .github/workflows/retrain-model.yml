@@ -1,6 +1,6 @@
-name: Retrain QRF Model (Rolling Schedule)
-# Runs daily at 04:00 AM ET (09:00 UTC) and on manual dispatch to keep model_qrf.joblib
-# trained on all newly scraped ISO-NE loads and 25-airport weather observations.
+name: Retrain QRF Model (Manual Dispatch Only)
+# Scheduled daily retrain is paused after resetting main to Dr. Dave's canonical
+# 11-feature Final Project baseline; manual dispatch remains available if needed.
 
 on:
   workflow_dispatch:
@@ -13,8 +13,6 @@ on:
         options:
           - "false"
           - "true"
-  schedule:
-    - cron: "0 9 * * *"   # Daily at 09:00 UTC (04:00 AM EST / 05:00 AM EDT)
 
 permissions:
   contents: read

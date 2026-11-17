@@ -114,8 +114,8 @@ def main():
         )
         if age_min > 90 or n_rows != 24 or has_nans or not ordered or not in_bounds:
             report.add("forecasts/latest.csv", "FAIL", detail)
-        elif rm != "hrrr_qrf_pooled":
-            report.add("forecasts/latest.csv", "WARN", detail + " (not using HRRR)")
+        elif rm not in ("range_model", "quantile_forest", "hrrr_qrf_pooled", "hrrr_qrf_pooled_nws"):
+            report.add("forecasts/latest.csv", "WARN", detail + f" (unexpected range_method={rm})")
         else:
             report.add("forecasts/latest.csv", "PASS", detail)
 
@@ -176,8 +176,9 @@ def main():
         w_obs["hour_utc"] = pd.to_datetime(w_obs["hour_utc"], utc=True)
         max_h = w_obs["hour_utc"].max()
         age_h = (now_ts - max_h).total_seconds() / 3600.0
-        req_cols = [c for c in f24.BASE_WEATHER + ["solar_wm2", "est_solar_gen_mw"] if c not in w_obs.columns]
-        recent_nans = int(w_obs.tail(6)[f24.BASE_WEATHER + ["solar_wm2"]].isna().sum().sum()) if not req_cols else -1
+        base_w = getattr(f24, "BASE_WEATHER", f24.WEATHER)
+        req_cols = [c for c in base_w if c not in w_obs.columns]
+        recent_nans = int(w_obs.tail(6)[base_w].isna().sum().sum()) if not req_cols else -1
         st = "FAIL" if (age_h > 3.5 or len(req_cols) > 0 or recent_nans > 0) else "PASS"
         report.add(
             "datasets/bdl_weather_obs_master.csv",
@@ -282,14 +283,14 @@ def main():
             hgbr_info = f", hgbr={hgbr_mb:.2f} MB (wm={wm:.2f}, wm_mse={wm_mse:.2f}, wb={wb:.2f}, widen={widen_s})"
         elif needs_hgbr:
             hgbr_info = ", hgbr=MISSING"
+        rm_card = str(card.get("range_method", "none"))
         detail = (
-            f"{s1_info}qrf={size_mb:.2f} MB (<=320){hgbr_info}, two_stage={two_stage}, trained {age_h:.1f}h ago, "
-            f"rows={card.get('train_rows')}, features_match={feats_match} ({len(card_feats)}/{len(f24.FEATURES)}), "
-            f"14d_crps={card.get('recent_14d_holdout_crps_mw', 'n/a')} MW"
+            f"{s1_info}qrf={size_mb:.2f} MB (<=320){hgbr_info}, method={rm_card}, two_stage={two_stage}, trained {age_h:.1f}h ago, "
+            f"features_match={feats_match} ({len(card_feats)}/{len(f24.FEATURES)}), widen={card.get('range_widen', 1.0)}"
         )
         if size_mb > 320.0 or s1_mb > 60.0 or not feats_match or not hgbr_ok or not s1_ok:
             report.add("Model Artifact & Card", "FAIL", detail)
-        elif age_h > 36.0:
+        elif age_h > 36.0 and two_stage:
             report.add("Model Artifact & Card", "WARN", detail + " (retrain >36h old)")
         else:
             report.add("Model Artifact & Card", "PASS", detail)
